@@ -4,6 +4,8 @@
 
 Created by [Jiaye1998](https://github.com/Jiaye1998).
 
+**[Visit the PaperPulse website →](https://jiaye1998.github.io/PaperPulse/)**
+
 PaperPulse is a local-first research intelligence dashboard. It reads currently unread Inoreader items, learns an editable research profile from a PDF or DOCX CV, and creates an English shortlist of the strongest articles—up to your chosen maximum, never padded to a quota.
 
 ![PaperPulse social card](public/og.png)
