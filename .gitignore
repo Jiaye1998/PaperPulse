@@ -1,0 +1,36 @@
+# Local secrets
+.env
+.env.local
+*.pem
+.paperpulse.key
+
+# PaperPulse local data
+data/
+*.db
+*.sqlite
+*.sqlite3
+uploads/
+logs/
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.paperpulse-test.sqlite3*
+
+# Node / build output
+node_modules/
+.next/
+.vinext/
+dist/
+.wrangler/
+coverage/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

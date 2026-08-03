@@ -1,0 +1,13 @@
+.git
+.github
+.env
+.venv
+node_modules
+data
+dist
+.next
+.vinext
+__pycache__
+*.pyc
+*.sqlite3
+*.log
