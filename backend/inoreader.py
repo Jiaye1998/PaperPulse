@@ -4,7 +4,7 @@ import secrets
 import time
 from datetime import UTC, datetime, timedelta
 from typing import Any
-from urllib.parse import quote, urlencode, urlparse
+from urllib.parse import quote, unquote, urlencode, urlparse
 
 import httpx
 from bs4 import BeautifulSoup
@@ -156,7 +156,26 @@ def _safe_http_url(value: Any) -> str:
     return candidate if parsed.scheme in {"http", "https"} and parsed.netloc else ""
 
 
-def _article_from_item(item: dict[str, Any]) -> dict[str, Any]:
+def _summary_quality(summary: str, has_both_sources: bool = False) -> float:
+    length = len(summary)
+    if not length:
+        return 0.1
+    if length < 120:
+        quality = 0.25
+    elif length < 300:
+        quality = 0.45
+    elif length < 700:
+        quality = 0.65
+    elif length < 1_200:
+        quality = 0.8
+    else:
+        quality = 0.9
+    return min(0.95, quality + (0.05 if has_both_sources else 0.0))
+
+
+def _article_from_item(
+    item: dict[str, Any], known_folders: set[str] | None = None
+) -> dict[str, Any]:
     intelligence = item.get("summaries") or []
     intelligence_text = (
         _plain_text(intelligence[0].get("summary", ""))
@@ -164,8 +183,21 @@ def _article_from_item(item: dict[str, Any]) -> dict[str, Any]:
         else ""
     )
     feed_text = _plain_text((item.get("summary") or {}).get("content", ""))
-    summary = intelligence_text or feed_text
-    quality = 1.0 if intelligence_text else min(0.95, max(0.2, len(summary) / 900))
+    # Feed text is the only source eligible for factual abstract analysis. An
+    # Inoreader-generated summary can help ranking when the feed omits text, but
+    # it must never be mixed into the evidence source.
+    if feed_text:
+        summary = feed_text
+        summary_source = "feed_abstract_or_excerpt"
+        quality = _summary_quality(summary)
+    elif intelligence_text:
+        summary = intelligence_text
+        summary_source = "inoreader_summary_fallback"
+        quality = min(0.35, _summary_quality(summary))
+    else:
+        summary = ""
+        summary_source = "none"
+        quality = _summary_quality(summary)
     links: list[Any] = []
     for key in ("canonical", "alternate"):
         value = item.get(key)
@@ -184,11 +216,18 @@ def _article_from_item(item: dict[str, Any]) -> dict[str, Any]:
     origin_value = item.get("origin")
     origin = origin_value if isinstance(origin_value, dict) else {}
     categories = item.get("categories") if isinstance(item.get("categories"), list) else []
-    folder_names = [
-        category.split("/label/", 1)[1]
+    label_names = [
+        unquote(category.split("/label/", 1)[1])
         for category in categories
         if isinstance(category, str) and "/label/" in category
     ]
+    folder_names = sorted(
+        {
+            name
+            for name in label_names
+            if known_folders is None or name in known_folders
+        }
+    )
     try:
         timestamp = int(item.get("published") or item.get("updated") or time.time())
         published = datetime.fromtimestamp(timestamp, tz=UTC).isoformat()
@@ -205,7 +244,12 @@ def _article_from_item(item: dict[str, Any]) -> dict[str, Any]:
         "published_at": published,
         "folder": folder_names[0] if folder_names else "Uncategorized",
         "summary_quality": quality,
-        "raw": {"timestampUsec": item.get("timestampUsec"), "categories": categories},
+        "raw": {
+            "timestampUsec": item.get("timestampUsec"),
+            "categories": categories,
+            "folders": folder_names,
+            "summary_source": summary_source,
+        },
     }
 
 
@@ -220,13 +264,31 @@ async def fetch_unread(unread_window_days: int = 7, max_items: int = 1000) -> tu
         "xt": READ_STATE,
         "output": "json",
         "summaries": "1",
-        "includeAllDirectStreamIds": "false",
+        "includeAllDirectStreamIds": "true",
     }
     headers = {"Authorization": f"Bearer {access_token}", "User-Agent": "PaperPulse/0.1"}
     articles: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
     rate: dict[str, str] = {}
     async with httpx.AsyncClient(timeout=45) as client:
+        known_folders: set[str] | None = None
+        try:
+            tag_response = await client.get(
+                f"{API_ROOT}/tag/list",
+                params={"types": 1},
+                headers=headers,
+            )
+            if not tag_response.is_error:
+                known_folders = set()
+                for tag in tag_response.json().get("tags", []):
+                    if not isinstance(tag, dict) or tag.get("type") != "folder":
+                        continue
+                    tag_id = str(tag.get("id", ""))
+                    if "/label/" in tag_id:
+                        known_folders.add(unquote(tag_id.split("/label/", 1)[1]))
+        except (httpx.HTTPError, ValueError):
+            # Folder metadata improves organization but should not block article refresh.
+            known_folders = None
         while len(articles) < max_items:
             response = await client.get(endpoint, params=params, headers=headers)
             if response.is_error:
@@ -239,7 +301,7 @@ async def fetch_unread(unread_window_days: int = 7, max_items: int = 1000) -> tu
                 if article_id in seen_ids:
                     continue
                 seen_ids.add(article_id)
-                articles.append(_article_from_item(item))
+                articles.append(_article_from_item(item, known_folders))
             rate = {
                 "limit": response.headers.get("X-Reader-Zone1-Limit", ""),
                 "usage": response.headers.get("X-Reader-Zone1-Usage", ""),

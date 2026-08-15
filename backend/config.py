@@ -28,6 +28,22 @@ class AppConfig:
     embedding_model: str = os.getenv(
         "PAPERPULSE_EMBEDDING_MODEL", "text-embedding-3-small"
     )
+    estimated_input_cost_per_million: float = float(
+        os.getenv("PAPERPULSE_EST_INPUT_USD_PER_MILLION", "1.0")
+    )
+    estimated_output_cost_per_million: float = float(
+        os.getenv("PAPERPULSE_EST_OUTPUT_USD_PER_MILLION", "6.0")
+    )
+    openalex_api_key: str = os.getenv("OPENALEX_API_KEY", "")
+    browser_abstracts: bool = os.getenv(
+        "PAPERPULSE_BROWSER_ABSTRACTS", "true"
+    ).lower() in {"1", "true", "yes", "on"}
+    browser_headless: bool = os.getenv(
+        "PAPERPULSE_BROWSER_HEADLESS", "true"
+    ).lower() in {"1", "true", "yes", "on"}
+    browser_timeout_ms: int = int(
+        os.getenv("PAPERPULSE_BROWSER_TIMEOUT_MS", "12000")
+    )
     inoreader_client_id: str = os.getenv("INOREADER_CLIENT_ID", "")
     inoreader_client_secret: str = os.getenv("INOREADER_CLIENT_SECRET", "")
     inoreader_redirect_uri: str = os.getenv(
@@ -49,7 +65,12 @@ class AppConfig:
     def uploads_dir(self) -> Path:
         return self.data_dir / "uploads"
 
+    @property
+    def browser_profile_dir(self) -> Path:
+        return self.data_dir / "browser-profile"
+
 
 config = AppConfig()
 config.data_dir.mkdir(parents=True, exist_ok=True)
 config.uploads_dir.mkdir(parents=True, exist_ok=True)
+config.browser_profile_dir.mkdir(parents=True, exist_ok=True)

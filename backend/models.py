@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, Field, StringConstraints
 
@@ -47,6 +47,10 @@ class ProfileUpdate(BaseModel):
     profile: ResearchProfile
 
 
+class BrowserVerificationRequest(BaseModel):
+    domain: str = Field(min_length=1, max_length=253)
+
+
 class RecommendationResult(BaseModel):
     article_id: str
     relevance_score: float = Field(ge=0, le=1)
@@ -58,5 +62,7 @@ class RecommendationResult(BaseModel):
     innovation: str
     connection: str
     idea: str
+    evidence: str = ""
+    research_structure: dict[str, Any] = Field(default_factory=dict)
     idea_is_speculative: bool = True
     labels: list[str] = Field(default_factory=list)
