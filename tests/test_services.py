@@ -19,6 +19,8 @@ from backend.abstract_enrichment import (
     _doi_batch_candidate,
     _get_json,
     _metadata_looks_complete,
+    _metadata_title_matches,
+    _plain_title,
     enrich_articles_with_public_abstracts,
     extract_abstract_from_html,
 )
@@ -753,6 +755,51 @@ class ServiceTests(unittest.TestCase):
             articles, rate = asyncio.run(fetch_unread(7, max_items=1000))
         self.assertEqual(rate["truncated"], "true")
         self.assertLessEqual(calls["n"], 3)
+
+    def test_title_matching_survives_formula_spacing_and_crossref_markup(self) -> None:
+        # A feed that renders subscripts as separate characters, matched against
+        # the same title written compactly.
+        self.assertTrue(
+            _metadata_title_matches(
+                "Wafer-scale heteroepitaxy of Sn-alloyed ε -Ga 2 O 3 on sapphire via mist-CVD",
+                "Wafer-scale heteroepitaxy of Sn-alloyed ε-Ga2O3 on sapphire via Mist-CVD",
+            )
+        )
+        # Crossref keeps JATS markup inside titles; the tag names must not become
+        # title words.
+        self.assertEqual(
+            _plain_title("Sn-alloyed <b>&#x03B5;</b>-Ga<sub>2</sub>O<sub>3</sub>"),
+            "Sn-alloyed ε -Ga 2 O 3",
+        )
+        self.assertTrue(
+            _metadata_title_matches(
+                "Preparation of a Ta 2 O 5 –SiO 2 composite bilayer using electron beams",
+                "Preparation of a Ta<sub>2</sub>O<sub>5</sub>–SiO<sub>2</sub> composite "
+                "bilayer using electron beams",
+            )
+        )
+        # A feed title that stops early still identifies the full record.
+        self.assertTrue(
+            _metadata_title_matches(
+                "Solar-blind optoelectronic synapses enabled by amorphous Ga 2 O 3",
+                "Solar-blind optoelectronic synapses enabled by amorphous Ga2O3 films",
+            )
+        )
+        # Different work on a neighbouring topic must still be refused.
+        self.assertFalse(
+            _metadata_title_matches(
+                "Solar-blind optoelectronic synapses enabled by amorphous Ga 2 O 3",
+                "Solar-Blind Optoelectronic Synaptic Transistor Based on aIGZO",
+            )
+        )
+        self.assertFalse(
+            _metadata_title_matches(
+                "Multiple spiking functionalities in annealing-optimized Ag devices",
+                "Recharged Catalyst with Memristive Nitrogen Reduction Activity",
+            )
+        )
+        # Two short titles sharing a prefix must not collapse into a match.
+        self.assertFalse(_metadata_title_matches("Graphene growth", "Graphene growth on Cu"))
 
     def test_inoreader_uses_only_confirmed_folder_labels(self) -> None:
         article = _article_from_item(

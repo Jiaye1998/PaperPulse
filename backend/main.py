@@ -308,10 +308,15 @@ async def inoreader_callback(code: str = "", state: str = "", error: str = "") -
 
 @app.post("/api/refresh")
 async def refresh() -> dict[str, object]:
+    # Checking and then acquiring lets two simultaneous callers both pass the
+    # check and queue up, running two full refreshes instead of rejecting one.
     if refresh_lock.locked():
         raise HTTPException(409, "A refresh is already in progress.")
-
-    async with refresh_lock:
+    try:
+        await asyncio.wait_for(refresh_lock.acquire(), timeout=0.01)
+    except (asyncio.TimeoutError, TimeoutError):
+        raise HTTPException(409, "A refresh is already in progress.") from None
+    try:
         settings = get_settings()
         refresh_id = create_refresh_run()
         try:
@@ -324,6 +329,7 @@ async def refresh() -> dict[str, object]:
                     )
                 purge_demo_data()
                 raw_incoming, rate = await fetch_unread(settings["first_sync_days"])
+                set_setting("inoreader_last_error", "")
                 incoming, ingest_stats = deduplicate_articles(raw_incoming)
                 cached_articles = get_articles_by_ids(
                     [str(article["id"]) for article in incoming]
@@ -450,6 +456,8 @@ async def refresh() -> dict[str, object]:
             complete_refresh_run(refresh_id, "failed", 0, 0, note=str(error))
             status_code = 400 if isinstance(error, InoreaderConfigurationError) else 502
             raise HTTPException(status_code, str(error)) from error
+    finally:
+        refresh_lock.release()
 
 
 @app.post("/api/articles/{article_id:path}/feedback")
