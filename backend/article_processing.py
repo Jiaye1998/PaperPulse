@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import re
 import unicodedata
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from typing import Any
 from urllib.parse import unquote, urlparse
 
@@ -11,9 +11,91 @@ from urllib.parse import unquote, urlparse
 DOI_PATTERN = re.compile(r"10\.\d{4,9}/[-._;()/:A-Z0-9]+", re.IGNORECASE)
 ARXIV_PATTERN = re.compile(r"(?:arxiv:|arxiv\.org/(?:abs|pdf)/)(\d{4}\.\d{4,5})(?:v\d+)?", re.IGNORECASE)
 
+# Publishers whose article URLs encode the DOI in a documented, reversible shape.
+# Feeds from these hosts frequently omit the DOI, which otherwise blocks every
+# DOI-keyed metadata lookup for the work.
+_URL_DOI_RULES: tuple[tuple[re.Pattern[str], re.Pattern[str], str], ...] = (
+    (
+        # A "/latest" URL hides the version number; v1 always exists in Crossref and
+        # carries the same abstract in all but a handful of revised preprints.
+        re.compile(r"(?:^|\.)researchsquare\.com$", re.IGNORECASE),
+        re.compile(r"/article/(rs-\d+)(?:/v(\d+))?", re.IGNORECASE),
+        "10.21203/rs.3.{0}/v{1}",
+    ),
+    (
+        re.compile(r"(?:^|\.)nature\.com$", re.IGNORECASE),
+        re.compile(r"/articles/(s\d{5}-\d{3}-\d{4,6}-[a-z0-9]+)", re.IGNORECASE),
+        "10.1038/{0}",
+    ),
+    (
+        re.compile(r"(?:^|\.)(?:bio|med)rxiv\.org$", re.IGNORECASE),
+        re.compile(r"/content/(10\.1101/[^/?#]+?)(?:\.full|\.abstract)?/?$", re.IGNORECASE),
+        "{0}",
+    ),
+)
+
 
 def _squash(value: str) -> str:
     return " ".join((value or "").split())
+
+
+# Feed entries that are not themselves research works. Left in the pool they reach
+# ranking, and a correction notice can even resolve to a "complete abstract" — either
+# the notice text, or the abstract of the paper it corrects — which then feeds
+# factual analysis. Substantive post-publication debate (Comment on / Reply to /
+# Matters Arising) is deliberately NOT listed: those carry real scientific argument.
+# A notice announces itself with a colon or by quoting the title it refers to.
+# Bare prose ("Retraction of consent in clinical cohorts", "Correction algorithms
+# for phase retrieval") is ordinary research and must survive these rules.
+_QUOTE = r"[\"'‘’“”]"
+
+NON_RESEARCH_TITLE_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "correction",
+        re.compile(
+            r"^\s*(?:(?:author|publisher)\s+correction\b"
+            rf"|correction\s+(?:to|for)\s*{_QUOTE}"
+            r"|correction\s*:"
+            r"|corrigend(?:um|a)\b|errat(?:um|a)\b)",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "retraction",
+        re.compile(
+            r"^\s*(?:retraction\s+note\b|retracted\s+article\b"
+            r"|(?:editorial\s+)?expression\s+of\s+concern\b"
+            r"|(?:retraction|retracted|withdrawn|withdrawal|removal)\s*:"
+            rf"|(?:retraction|withdrawal)\s+of\s*{_QUOTE})",
+            re.IGNORECASE,
+        ),
+    ),
+    ("addendum", re.compile(r"^\s*addend(?:um|a)\s*(?::|to\b)", re.IGNORECASE)),
+    (
+        "journal_front_matter",
+        re.compile(
+            r"^\s*(?:in\s+this\s+issue|issue\s+information|masthead|table\s+of\s+contents"
+            r"|contents\s+list|front\s+cover|back\s+cover|inside\s+(?:front|back)\s+cover"
+            r"|cover\s+(?:picture|feature|image)|editorial\s*(?:board\b|:|$)"
+            r"|call\s+for\s+papers|acknowledge?ment\s+to\s+reviewers)",
+            re.IGNORECASE,
+        ),
+    ),
+)
+# Nature reserves the d##### DOI family for news, features, and other magazine
+# content rather than peer-reviewed articles.
+NON_RESEARCH_URL_RULE = re.compile(r"/articles/d\d{5}-", re.IGNORECASE)
+
+
+def non_research_kind(article: dict[str, Any]) -> str:
+    """Name the non-research category of a feed entry, or "" for a real work."""
+    title = _squash(str(article.get("title", "")))
+    for kind, pattern in NON_RESEARCH_TITLE_RULES:
+        if pattern.search(title):
+            return kind
+    if NON_RESEARCH_URL_RULE.search(str(article.get("url", ""))):
+        return "news"
+    return ""
 
 
 def normalize_title(value: str) -> str:
@@ -63,12 +145,55 @@ def canonical_url(value: str) -> str:
     return f"{host}{path}"
 
 
+def derive_doi_from_url(url: str) -> str:
+    """Rebuild the DOI a publisher encoded in its article URL.
+
+    Only reversible, publisher-documented URL shapes are handled; anything else
+    returns an empty string rather than a guess.
+    """
+    parsed = urlparse(url or "")
+    host = (parsed.hostname or "").casefold().removeprefix("www.")
+    if not host:
+        return ""
+    path = unquote(parsed.path)
+    for host_pattern, path_pattern, template in _URL_DOI_RULES:
+        if not host_pattern.search(host):
+            continue
+        match = path_pattern.search(path)
+        if not match:
+            continue
+        groups = [group or "" for group in match.groups()]
+        if len(groups) > 1 and not groups[1]:
+            groups[1] = "1"
+        return template.format(*groups).rstrip(".,;)").casefold()
+    return ""
+
+
+PII_PATTERN = re.compile(r"/science/article/(?:abs/|pii/)?pii/([A-Z0-9]{17})", re.IGNORECASE)
+
+
+def extract_elsevier_pii(url: str) -> str:
+    """Return the PII in a ScienceDirect URL.
+
+    Elsevier feeds carry no DOI and its article URLs are keyed by PII instead, so
+    the PII is the only identifier available for these works. Crossref indexes it
+    as an alternative-id, which makes it resolvable to the real DOI.
+    """
+    parsed = urlparse(url or "")
+    if "sciencedirect.com" not in (parsed.hostname or "").casefold():
+        return ""
+    match = PII_PATTERN.search(unquote(parsed.path))
+    return match.group(1).upper() if match else ""
+
+
 def extract_doi(article: dict[str, Any]) -> str:
     haystack = " ".join(
         str(article.get(field, "")) for field in ("url", "title", "summary")
     )
     match = DOI_PATTERN.search(unquote(haystack))
-    return match.group(0).rstrip(".,;)").casefold() if match else ""
+    if match:
+        return match.group(0).rstrip(".,;)").casefold()
+    return derive_doi_from_url(str(article.get("url", "")))
 
 
 def extract_arxiv_id(article: dict[str, Any]) -> str:
@@ -173,11 +298,16 @@ def _article_folders(article: dict[str, Any]) -> list[str]:
 
 def deduplicate_articles(
     articles: list[dict[str, Any]],
-) -> tuple[list[dict[str, Any]], dict[str, int]]:
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     works: OrderedDict[str, dict[str, Any]] = OrderedDict()
     identity_index: dict[str, str] = {}
+    excluded: Counter[str] = Counter()
     for raw_article in articles:
         article = dict(raw_article)
+        kind = non_research_kind(article)
+        if kind:
+            excluded[kind] += 1
+            continue
         original_source = _squash(str(article.get("source", "Unknown source")))
         canonical_source = canonical_source_name(original_source)
         article["source"] = canonical_source
@@ -242,10 +372,15 @@ def deduplicate_articles(
             identity_index[item_key] = key
 
     unique = list(works.values())
+    kept = len(articles) - sum(excluded.values())
     return unique, {
         "received_count": len(articles),
         "unique_count": len(unique),
-        "duplicate_count": len(articles) - len(unique),
+        # Excluded entries were never candidates, so they must not be reported as
+        # duplicates of the works that remain.
+        "duplicate_count": kept - len(unique),
+        "non_research_count": sum(excluded.values()),
+        "non_research_breakdown": dict(excluded),
         "missing_summary_count": sum(not item.get("summary") for item in unique),
         "thin_summary_count": sum(
             0 < len(str(item.get("summary", ""))) < 200 for item in unique
@@ -323,6 +458,8 @@ def source_abstract(article: dict[str, Any]) -> tuple[str, str]:
         "publisher_page_abstract",
         "publisher_browser_abstract",
         "crossref_abstract",
+        "europepmc_abstract",
+        "scopus_abstract",
         "openalex_abstract",
         "arxiv_feed_abstract",
         "demo_abstract",

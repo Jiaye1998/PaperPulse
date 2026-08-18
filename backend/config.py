@@ -35,6 +35,14 @@ class AppConfig:
         os.getenv("PAPERPULSE_EST_OUTPUT_USD_PER_MILLION", "6.0")
     )
     openalex_api_key: str = os.getenv("OPENALEX_API_KEY", "")
+    # Crossref and OpenAlex move identified clients into their "polite" pool, which
+    # is what keeps a few hundred lookups per refresh from being throttled to 429.
+    contact_email: str = os.getenv("PAPERPULSE_CONTACT_EMAIL", "")
+    # Elsevier deposits no abstracts to any open service, so its catalogue is only
+    # reachable through Scopus, and only for an entitled institution. The optional
+    # institution token extends that entitlement off the campus network.
+    elsevier_api_key: str = os.getenv("ELSEVIER_API_KEY", "")
+    elsevier_insttoken: str = os.getenv("ELSEVIER_INSTTOKEN", "")
     browser_abstracts: bool = os.getenv(
         "PAPERPULSE_BROWSER_ABSTRACTS", "true"
     ).lower() in {"1", "true", "yes", "on"}

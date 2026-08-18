@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import unittest
 from contextlib import contextmanager
@@ -10,8 +11,15 @@ from unittest.mock import patch
 
 from backend import db
 from backend.abstract_enrichment import (
+    API_RETRY_ATTEMPTS,
+    AbstractCandidate,
+    _ServiceGate,
     _crossref_candidate,
     _crossref_search_candidate,
+    _doi_batch_candidate,
+    _get_json,
+    _metadata_looks_complete,
+    enrich_articles_with_public_abstracts,
     extract_abstract_from_html,
 )
 from backend.article_processing import (
@@ -19,7 +27,11 @@ from backend.article_processing import (
     claim_is_supported,
     classify_article,
     deduplicate_articles,
+    derive_doi_from_url,
     evidence_is_grounded,
+    extract_doi,
+    extract_elsevier_pii,
+    non_research_kind,
     source_abstract,
 )
 from backend.browser_abstracts import CHALLENGE_TEXT, open_verification_browser
@@ -42,6 +54,10 @@ from backend.ranking import (
     _select_valid_recommendations,
     rank_articles,
 )
+
+
+async def _no_sleep(_seconds: float) -> None:
+    """Collapse retry backoff so throttling tests stay fast."""
 
 
 @contextmanager
@@ -212,6 +228,332 @@ class ServiceTests(unittest.TestCase):
         self.assertIsNotNone(search_candidate)
         assert search_candidate is not None
         self.assertEqual(search_candidate.doi, "")
+
+    def test_corrections_retractions_and_front_matter_leave_the_pool(self) -> None:
+        excluded = [
+            "Author Correction: Structural mechanism of cGAS inhibition",
+            "Publisher Correction: A charged cage for excitons",
+            "Correction to “Designing the Future of Hardmetals”",
+            "Corrigendum to a study of perovskite interfaces",
+            "Erratum: Thermal transport in layered oxides",
+            "Retraction Note to: Exosome-mediated tendon repair",
+            "Retracted: Graphene growth on liquid copper",
+            "Withdrawn: Preliminary results on spin transport",
+            "Expression of Concern: Image duplication in Figure 3",
+            "Addendum: Extended data for the catalytic cycle",
+            "In This Issue",
+            "Issue Information",
+            "Inside Front Cover: Molecular sieving membranes",
+            "Editorial Board",
+        ]
+        for title in excluded:
+            self.assertTrue(
+                non_research_kind({"title": title, "url": "https://example.org/a"}),
+                f"should be excluded: {title}",
+            )
+
+        kept = [
+            # Substantive post-publication debate is real science and stays.
+            "Comment on “Anomalous thermal conductivity in twisted bilayers”",
+            "Reply to Zhang et al.: The role of surface defects",
+            "Matters Arising: Reassessing the reported quantum yield",
+            # Research whose title merely contains a trigger word.
+            "Correction algorithms for phase retrieval in ptychography",
+            "Editorial control of gene expression by CRISPR base editors",
+            "Retraction of consent in longitudinal clinical cohorts",
+            "Addenda-free synthesis of high-entropy alloys",
+        ]
+        for title in kept:
+            self.assertEqual(
+                non_research_kind({"title": title, "url": "https://example.org/a"}),
+                "",
+                f"should be kept: {title}",
+            )
+
+        # Nature reserves the d##### DOI family for magazine content.
+        self.assertEqual(
+            non_research_kind(
+                {"title": "Can invisible watermarks curb AI slop?",
+                 "url": "https://www.nature.com/articles/d41586-026-02503-7"}
+            ),
+            "news",
+        )
+        self.assertEqual(
+            non_research_kind(
+                {"title": "Nanoporous monolayer metal enables confinement",
+                 "url": "https://www.nature.com/articles/s41565-026-02240-y"}
+            ),
+            "",
+        )
+
+        unique, stats = deduplicate_articles(
+            [
+                {"id": "1", "title": "Erratum: something", "url": "https://a.org/1",
+                 "source": "J", "summary": "x"},
+                {"id": "2", "title": "A real study of layered oxide cathodes",
+                 "url": "https://a.org/2", "source": "J", "summary": "x"},
+                {"id": "3", "title": "A real study of layered oxide cathodes",
+                 "url": "https://a.org/2", "source": "J", "summary": "x"},
+            ]
+        )
+        self.assertEqual(len(unique), 1)
+        self.assertEqual(stats["non_research_count"], 1)
+        self.assertEqual(stats["non_research_breakdown"], {"correction": 1})
+        # The excluded entry must not be miscounted as a duplicate of what remains.
+        self.assertEqual(stats["duplicate_count"], 1)
+
+    def test_sciencedirect_pii_is_extracted_and_preprints_lose_title_matches(self) -> None:
+        self.assertEqual(
+            extract_elsevier_pii(
+                "https://www.sciencedirect.com/science/article/pii/S0925838826041976?dgcid=rss_sd_all"
+            ),
+            "S0925838826041976",
+        )
+        self.assertEqual(
+            extract_elsevier_pii(
+                "https://www.sciencedirect.com/science/article/abs/pii/S221128552600594X"
+            ),
+            "S221128552600594X",
+        )
+        self.assertEqual(extract_elsevier_pii("https://www.nature.com/articles/s41467-1"), "")
+
+        body = (
+            "AlN/GaN heterojunctions exhibit significant potential for high-efficiency "
+            "millimeter-wave devices due to their thin barrier layers and high-density "
+            "two-dimensional electron gas measured across the grown wafers."
+        )
+        title = "Interfacial rearrangement of metal atoms controlled by adsorption layers"
+        preprint = {
+            "message": {
+                "items": [
+                    {
+                        "DOI": "10.2139/ssrn.6604099",
+                        "type": "posted-content",
+                        "title": [title],
+                        "abstract": body,
+                    }
+                ]
+            }
+        }
+        # The journal article is what the feed pointed at; its SSRN preprint carries a
+        # different DOI and a possibly older text, so title matching must not take it.
+        self.assertIsNone(
+            _crossref_search_candidate(
+                preprint, title, "https://api.crossref.org/works", reject_preprints=True
+            )
+        )
+        accepted = _crossref_search_candidate(
+            preprint, title, "https://api.crossref.org/works"
+        )
+        self.assertIsNotNone(accepted)
+
+    def test_publisher_url_shapes_yield_doi_for_metadata_lookup(self) -> None:
+        self.assertEqual(
+            derive_doi_from_url("https://www.researchsquare.com/article/rs-10515961/latest"),
+            "10.21203/rs.3.rs-10515961/v1",
+        )
+        self.assertEqual(
+            derive_doi_from_url("https://www.researchsquare.com/article/rs-884422/v3"),
+            "10.21203/rs.3.rs-884422/v3",
+        )
+        self.assertEqual(
+            derive_doi_from_url("https://www.nature.com/articles/s41467-025-62831-6"),
+            "10.1038/s41467-025-62831-6",
+        )
+        self.assertEqual(
+            derive_doi_from_url("https://www.biorxiv.org/content/10.1101/2024.01.02.573210v1"),
+            "10.1101/2024.01.02.573210v1",
+        )
+        # News pieces and unknown hosts must not produce an invented DOI.
+        self.assertEqual(derive_doi_from_url("https://www.nature.com/articles/d41586-025-1"), "")
+        self.assertEqual(derive_doi_from_url("https://www.youtube.com/watch?v=abc"), "")
+        self.assertEqual(
+            extract_doi({"url": "https://www.researchsquare.com/article/rs-42/latest"}),
+            "10.21203/rs.3.rs-42/v1",
+        )
+
+    def test_doi_batch_rejects_abstract_belonging_to_another_work(self) -> None:
+        article = {"id": "a1", "title": "Perovskite solar cell interface passivation"}
+        body = (
+            "We passivate the perovskite interface and track device stability over "
+            "one thousand hours of continuous operation under standard illumination."
+        )
+        accepted = _doi_batch_candidate(
+            article, body, "Perovskite solar cell interface passivation",
+            "crossref_abstract", 95, "https://doi.org/10.1/x", "10.1/x",
+        )
+        self.assertIsNotNone(accepted)
+        assert accepted is not None
+        self.assertTrue(accepted.complete)
+        self.assertEqual(accepted.doi, "10.1/x")
+        self.assertIsNone(
+            _doi_batch_candidate(
+                article, body, "A genome-wide survey of marine archaea",
+                "crossref_abstract", 95, "https://doi.org/10.1/x", "10.1/x",
+            )
+        )
+        # A metadata abstract field stays trustworthy below the scraped-page floor,
+        # but an explicit truncation mark still demotes it.
+        short = "We report a compact source of narrowband heralded single photons in the telecom band."
+        candidate = _doi_batch_candidate(
+            article, short, "", "crossref_abstract", 95, "https://doi.org/10.1/x", "10.1/x"
+        )
+        assert candidate is not None
+        self.assertFalse(candidate.complete)
+        self.assertTrue(_metadata_looks_complete(body))
+        self.assertFalse(_metadata_looks_complete(body[:200] + " ..."))
+
+    def test_throttled_service_is_dropped_instead_of_retried_all_run(self) -> None:
+        calls = {"count": 0}
+
+        class _Response:
+            status_code = 429
+            headers = {"retry-after": "0"}
+            is_error = True
+
+            def json(self) -> dict[str, object]:
+                return {}
+
+        class _Client:
+            async def get(self, url: str, **kwargs: object) -> _Response:
+                calls["count"] += 1
+                return _Response()
+
+        async def exercise() -> _ServiceGate:
+            gate = _ServiceGate(0.0, failure_budget=2)
+            client = _Client()
+            with patch("backend.abstract_enrichment.asyncio.sleep", new=_no_sleep):
+                for _ in range(25):
+                    self.assertIsNone(
+                        await _get_json(client, gate, "https://api.example.org/works", {})
+                    )
+            return gate
+
+        gate = asyncio.run(exercise())
+        self.assertTrue(gate.disabled)
+        # Two exhausted ladders spend the budget; the remaining 23 calls are free.
+        self.assertEqual(calls["count"], 2 * API_RETRY_ATTEMPTS)
+
+    def test_enrichment_stages_run_cheapest_first_and_browser_sees_only_residue(
+        self,
+    ) -> None:
+        body = (
+            "We report a layered oxide cathode synthesised by a molten-salt route and "
+            "characterised by operando diffraction across two hundred charge cycles, "
+            "with capacity retention compared against an unmodified reference cell."
+        )
+        articles = [
+            {
+                "id": "cached",
+                "title": "Cached work",
+                "url": "https://example.org/cached",
+                "summary": body,
+                "raw": {},
+            },
+            {
+                "id": "arxiv",
+                "title": "Preprint work",
+                "url": "https://arxiv.org/abs/2501.00001",
+                "summary": f"Announce Type: new Abstract: {body}",
+                "raw": {"arxiv_id": "2501.00001"},
+            },
+            {
+                "id": "doi",
+                "title": "Crossref work",
+                "url": "https://onlinelibrary.wiley.com/doi/10.1002/test.1",
+                "summary": "Short feed blurb ...",
+                "raw": {"doi": "10.1002/test.1"},
+            },
+            {
+                "id": "residue",
+                "title": "Bot-walled work",
+                "url": "https://paywall.example.com/article/9",
+                "summary": "Short feed blurb ...",
+                "raw": {},
+            },
+        ]
+        cached = [
+            {
+                "id": "cached",
+                "title": "Cached work",
+                "url": "https://example.org/cached",
+                "summary": body,
+                "raw": {
+                    "abstract_status": "complete",
+                    "summary_source": "crossref_abstract",
+                    "abstract_source_url": "https://doi.org/10.1/cached",
+                    "abstract_fetched_at": "2026-01-01T00:00:00+00:00",
+                },
+            }
+        ]
+        crossref_payload = {
+            "message": {
+                "items": [
+                    {"DOI": "10.1002/test.1", "title": ["Crossref work"], "abstract": body}
+                ]
+            }
+        }
+        seen_by_browser: list[str] = []
+
+        async def fake_get_json(_client, gate, url, _params):
+            if "crossref" in url:
+                return crossref_payload
+            return None
+
+        async def fake_pages(_client, articles_arg, resolved, _blocked, stats):
+            stats["page_attempted"] = len(
+                [a for a in articles_arg if str(a["id"]) not in resolved]
+            )
+            stats["page_hits"] = 0
+
+        async def fake_browser(pending, _extractor):
+            seen_by_browser.extend(str(item["id"]) for item in pending)
+            return SimpleNamespace(
+                candidates={
+                    "residue": AbstractCandidate(
+                        text=body,
+                        provenance="publisher_browser_abstract",
+                        complete=True,
+                        source_url="https://paywall.example.com/article/9",
+                        priority=110,
+                    )
+                },
+                attempted=len(pending),
+                available=True,
+                challenges=[],
+                refused_domains=[],
+                error="",
+            )
+
+        with (
+            patch("backend.abstract_enrichment._get_json", new=fake_get_json),
+            patch("backend.abstract_enrichment._resolve_publisher_pages", new=fake_pages),
+            patch(
+                "backend.browser_abstracts.resolve_with_persistent_browser",
+                new=fake_browser,
+            ),
+        ):
+            enriched, stats = asyncio.run(
+                enrich_articles_with_public_abstracts(articles, cached)
+            )
+
+        by_id = {item["id"]: item for item in enriched}
+        self.assertEqual(by_id["cached"]["raw"]["summary_source"], "crossref_abstract")
+        self.assertEqual(by_id["arxiv"]["raw"]["summary_source"], "arxiv_feed_abstract")
+        self.assertEqual(by_id["doi"]["raw"]["summary_source"], "crossref_abstract")
+        self.assertEqual(
+            by_id["residue"]["raw"]["summary_source"], "publisher_browser_abstract"
+        )
+        for item in enriched:
+            self.assertEqual(item["raw"]["abstract_status"], "complete")
+        # Cached and arXiv works never reach the network; the browser is handed only
+        # what every cheaper stage failed to resolve.
+        self.assertEqual(seen_by_browser, ["residue"])
+        self.assertEqual(stats["cache_hits"], 1)
+        self.assertEqual(stats["attempted"], 2)
+        self.assertEqual(stats["crossref_batch_hits"], 1)
+        self.assertEqual(stats["complete"], 4)
+        self.assertEqual(stats["browser_complete"], 1)
 
     def test_inoreader_uses_only_confirmed_folder_labels(self) -> None:
         article = _article_from_item(

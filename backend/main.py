@@ -352,12 +352,36 @@ async def refresh() -> dict[str, object]:
                     f"Inoreader zone 1 usage: {rate.get('usage') or '—'} / "
                     f"{rate.get('limit') or '—'}"
                 )
+                resolution = ", ".join(
+                    f"{label} {abstract_stats.get(key, 0)}"
+                    for label, key in (
+                        ("cache", "cache_hits"),
+                        ("crossref", "crossref_batch_hits"),
+                        ("europepmc", "europepmc_batch_hits"),
+                        ("openalex", "openalex_batch_hits"),
+                        ("title search", "title_search_hits"),
+                        ("publisher page", "page_hits"),
+                        ("browser", "browser_complete"),
+                    )
+                    if abstract_stats.get(key)
+                )
+                if ingest_stats.get("non_research_count"):
+                    breakdown = ", ".join(
+                        f"{kind} {count}"
+                        for kind, count in sorted(
+                            (ingest_stats.get("non_research_breakdown") or {}).items()
+                        )
+                    )
+                    source_note += (
+                        f"; excluded {ingest_stats['non_research_count']} non-research "
+                        f"entries ({breakdown})"
+                    )
                 source_note += (
                     f"; public abstracts: {abstract_stats['complete']} complete, "
                     f"{abstract_stats['excerpt']} excerpt-only, "
-                    f"{abstract_stats['unavailable']} unavailable "
-                    f"({abstract_stats['cache_hits']} cache hits); browser-confirmed: "
-                    f"{abstract_stats.get('browser_complete', 0)}, verification domains: "
+                    f"{abstract_stats['unavailable']} unavailable"
+                    + (f" (resolved by {resolution})" if resolution else "")
+                    + f"; verification domains: "
                     f"{len(abstract_stats.get('verification_required', []))}."
                 )
             elif config.demo_mode:

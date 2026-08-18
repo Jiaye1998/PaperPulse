@@ -279,6 +279,8 @@ function abstractBadge(item: Recommendation) {
     if (item.summary_source === "publisher_browser_abstract") return "FULL ABSTRACT · LIVE PUBLISHER PAGE";
     if (item.summary_source === "arxiv_feed_abstract") return "FULL ABSTRACT · ARXIV";
     if (item.summary_source === "crossref_abstract") return "FULL ABSTRACT · CROSSREF";
+    if (item.summary_source === "europepmc_abstract") return "FULL ABSTRACT · EUROPE PMC";
+    if (item.summary_source === "scopus_abstract") return "FULL ABSTRACT · SCOPUS";
     if (item.summary_source === "openalex_abstract") return "FULL ABSTRACT · OPENALEX";
     return "FULL ABSTRACT · PUBLISHER";
   }

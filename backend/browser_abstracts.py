@@ -16,6 +16,9 @@ from .config import config
 
 
 BROWSER_DOMAIN_CONCURRENCY = 4
+# A bot wall answers with a status code even when it renders like a page.
+REFUSAL_STATUSES = frozenset({401, 403, 407, 429, 451})
+DOMAIN_REFUSAL_LIMIT = 2
 ABSTRACT_CONTROL = re.compile(r"^\s*(?:abstract|summary)\s*$", re.IGNORECASE)
 CHALLENGE_TEXT = re.compile(
     r"(?:just a moment|verify you are human|verification required|captcha|"
@@ -32,6 +35,7 @@ class BrowserBatchResult:
     attempted: int = 0
     available: bool = False
     challenges: list[dict[str, str]] = field(default_factory=list)
+    refused_domains: list[str] = field(default_factory=list)
     error: str = ""
 
 
@@ -176,12 +180,14 @@ async def resolve_with_persistent_browser(
                 async with domain_limit:
                     page = await context.new_page()
                     page.set_default_timeout(3_000)
+                    refusals = 0
                     try:
                         for index, article in enumerate(domain_articles):
                             result.attempted += 1
                             article_url = str(article.get("url", ""))
+                            response = None
                             try:
-                                await page.goto(
+                                response = await page.goto(
                                     article_url,
                                     wait_until="domcontentloaded",
                                     timeout=config.browser_timeout_ms,
@@ -190,6 +196,15 @@ async def resolve_with_persistent_browser(
                                 # A page can expose usable metadata before all trackers finish.
                                 pass
                             except Exception:
+                                continue
+                            if response is not None and response.status in REFUSAL_STATUSES:
+                                # Some publishers answer automation with a block page that
+                                # renders like an article shell. Re-requesting it only
+                                # wastes the run, and no manual verification can clear it.
+                                refusals += 1
+                                if refusals >= DOMAIN_REFUSAL_LIMIT:
+                                    result.refused_domains.append(domain)
+                                    break
                                 continue
                             await page.wait_for_timeout(500)
                             try:
