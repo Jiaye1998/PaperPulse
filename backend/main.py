@@ -352,10 +352,18 @@ async def refresh() -> dict[str, object]:
                     f"Inoreader zone 1 usage: {rate.get('usage') or '—'} / "
                     f"{rate.get('limit') or '—'}"
                 )
+                if rate.get("truncated"):
+                    source_note += (
+                        f"; WARNING: more unread items exist than the "
+                        f"{rate.get('scan_limit')}-item scan limit, so the oldest "
+                        f"were not considered — mark items read in Inoreader, or "
+                        f"narrow the scan window"
+                    )
                 resolution = ", ".join(
                     f"{label} {abstract_stats.get(key, 0)}"
                     for label, key in (
                         ("cache", "cache_hits"),
+                        ("arxiv feed", "arxiv_feed_hits"),
                         ("crossref", "crossref_batch_hits"),
                         ("europepmc", "europepmc_batch_hits"),
                         ("openalex", "openalex_batch_hits"),

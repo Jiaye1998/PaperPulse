@@ -16,7 +16,12 @@ from urllib.parse import urljoin, urlparse
 import httpx
 from bs4 import BeautifulSoup
 
-from .article_processing import extract_doi, extract_elsevier_pii, normalize_title
+from .article_processing import (
+    extract_doi,
+    extract_elsevier_pii,
+    is_preprint_source,
+    normalize_title,
+)
 from .config import config
 
 
@@ -852,7 +857,12 @@ async def _resolve_by_title(
             ),
         )
         candidate = _crossref_search_candidate(
-            payload, title, "https://api.crossref.org/works", reject_preprints=True
+            payload,
+            title,
+            "https://api.crossref.org/works",
+            # On a preprint server the posted-content record IS the work; only a
+            # journal article needs protecting from matching its own preprint.
+            reject_preprints=not is_preprint_source(article),
         )
         if candidate is None:
             payload = await _get_json(
@@ -1017,6 +1027,7 @@ async def enrich_articles_with_public_abstracts(
     stats: dict[str, Any] = {
         "attempted": 0,
         "cache_hits": 0,
+        "arxiv_feed_hits": 0,
         "complete": 0,
         "excerpt": 0,
         "unavailable": 0,
@@ -1036,6 +1047,7 @@ async def enrich_articles_with_public_abstracts(
         if arxiv:
             _apply_candidate(article, arxiv)
             stats["complete"] += 1
+            stats["arxiv_feed_hits"] += 1
             continue
         pending.append(article)
 

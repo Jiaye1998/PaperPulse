@@ -31,13 +31,14 @@ from backend.article_processing import (
     evidence_is_grounded,
     extract_doi,
     extract_elsevier_pii,
+    is_preprint_source,
     non_research_kind,
     source_abstract,
 )
 from backend.browser_abstracts import CHALLENGE_TEXT, open_verification_browser
 from backend.crypto import decrypt_text
 from backend.demo_data import DEMO_ARTICLES, DEMO_PROFILE
-from backend.inoreader import _article_from_item
+from backend.inoreader import _article_from_item, fetch_unread
 from backend.idea_lab import (
     _abstract_diagnostic,
     _generate_ideas,
@@ -58,6 +59,10 @@ from backend.ranking import (
 
 async def _no_sleep(_seconds: float) -> None:
     """Collapse retry backoff so throttling tests stay fast."""
+
+
+async def _fake_token() -> str:
+    return "test-token"
 
 
 @contextmanager
@@ -270,6 +275,25 @@ class ServiceTests(unittest.TestCase):
                 f"should be kept: {title}",
             )
 
+        # Video and general-news subscriptions can never yield a research abstract.
+        for url in (
+            "https://www.youtube.com/watch?v=abc123",
+            "https://phys.org/news/2026-08-quantum.html",
+            "https://www.wired.com/story/some-story",
+        ):
+            self.assertEqual(
+                non_research_kind({"title": "A plausible science headline", "url": url}),
+                "non_scholarly_source",
+                f"should be excluded: {url}",
+            )
+        # A publisher host that merely contains a listed name must survive.
+        self.assertEqual(
+            non_research_kind(
+                {"title": "Real study", "url": "https://pubs.acs.org/doi/10.1021/x"}
+            ),
+            "",
+        )
+
         # Nature reserves the d##### DOI family for magazine content.
         self.assertEqual(
             non_research_kind(
@@ -315,6 +339,17 @@ class ServiceTests(unittest.TestCase):
             ),
             "S221128552600594X",
         )
+        # Elsevier's society sites punctuate the same identifier.
+        self.assertEqual(
+            extract_elsevier_pii("https://www.cell.com/cell/fulltext/S0092-8674(26)00828-7"),
+            "S0092867426008287",
+        )
+        self.assertEqual(
+            extract_elsevier_pii(
+                "https://www.cell.com/action/showPdf?pii=S0092-8674%2826%2900828-7"
+            ),
+            "S0092867426008287",
+        )
         self.assertEqual(extract_elsevier_pii("https://www.nature.com/articles/s41467-1"), "")
 
         body = (
@@ -347,6 +382,72 @@ class ServiceTests(unittest.TestCase):
         )
         self.assertIsNotNone(accepted)
 
+    def test_preprint_servers_keep_their_own_posted_content_records(self) -> None:
+        # ChemRxiv, bioRxiv and friends publish nothing but posted-content, and
+        # their article URLs carry no DOI, so title search is the only route to
+        # their abstracts. Rejecting posted-content outright would silence them.
+        for url in (
+            "https://chemrxiv.org/engage/chemrxiv/article-details/68a1f2c3b4d5",
+            "https://www.biorxiv.org/content/10.1101/2024.01.02.573210v1",
+            "https://www.researchsquare.com/article/rs-10515961/latest",
+            "https://arxiv.org/abs/2501.00001",
+        ):
+            self.assertTrue(
+                is_preprint_source({"url": url, "title": "t", "summary": ""}),
+                f"should count as a preprint source: {url}",
+            )
+        for url in (
+            "https://pubs.acs.org/doi/10.1021/acsami.5c00001",
+            "https://www.sciencedirect.com/science/article/pii/S0925838826041976",
+            "https://pubs.rsc.org/en/content/articlelanding/2026/sc/d5sc00001a",
+        ):
+            self.assertFalse(
+                is_preprint_source({"url": url, "title": "t", "summary": ""}),
+                f"should not count as a preprint source: {url}",
+            )
+
+        body = (
+            "We report a dynamic kinetic resolution guided by numerical simulation, "
+            "with conversion and enantiomeric excess tracked across twelve substrates "
+            "under otherwise identical catalytic conditions."
+        )
+        title = "Numerical simulation-guided development of dynamic kinetic resolution"
+        payload = {
+            "message": {
+                "items": [
+                    {
+                        "DOI": "10.26434/chemrxiv.15001461/v2",
+                        "type": "posted-content",
+                        "title": [title],
+                        "abstract": body,
+                    }
+                ]
+            }
+        }
+        kept = _crossref_search_candidate(
+            payload,
+            title,
+            "https://api.crossref.org/works",
+            reject_preprints=not is_preprint_source(
+                {"url": "https://chemrxiv.org/engage/chemrxiv/article-details/x"}
+            ),
+        )
+        self.assertIsNotNone(kept)
+        assert kept is not None
+        self.assertTrue(kept.complete)
+
+        # The same record must still be refused for a journal article.
+        self.assertIsNone(
+            _crossref_search_candidate(
+                payload,
+                title,
+                "https://api.crossref.org/works",
+                reject_preprints=not is_preprint_source(
+                    {"url": "https://pubs.acs.org/doi/10.1021/jacs.5c00001"}
+                ),
+            )
+        )
+
     def test_publisher_url_shapes_yield_doi_for_metadata_lookup(self) -> None:
         self.assertEqual(
             derive_doi_from_url("https://www.researchsquare.com/article/rs-10515961/latest"),
@@ -363,6 +464,22 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(
             derive_doi_from_url("https://www.biorxiv.org/content/10.1101/2024.01.02.573210v1"),
             "10.1101/2024.01.02.573210v1",
+        )
+        # An RSC article URL ends in the DOI suffix itself.
+        self.assertEqual(
+            derive_doi_from_url(
+                "https://pubs.rsc.org/en/content/articlelanding/2026/cc/d6cc03277j"
+            ),
+            "10.1039/d6cc03277j",
+        )
+        self.assertEqual(
+            derive_doi_from_url(
+                "https://pubs.rsc.org/en/content/articlehtml/2026/ta/d5ta04521e/unauth"
+            ),
+            "10.1039/d5ta04521e",
+        )
+        self.assertEqual(
+            derive_doi_from_url("https://pubs.rsc.org/en/journals/journalissues/cc"), ""
         )
         # News pieces and unknown hosts must not produce an invented DOI.
         self.assertEqual(derive_doi_from_url("https://www.nature.com/articles/d41586-025-1"), "")
@@ -554,6 +671,59 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(stats["crossref_batch_hits"], 1)
         self.assertEqual(stats["complete"], 4)
         self.assertEqual(stats["browser_complete"], 1)
+
+    def test_unread_scan_reports_truncation_and_cannot_spin_on_a_cursor(self) -> None:
+        calls = {"n": 0}
+
+        def item(index: int) -> dict[str, object]:
+            return {
+                "id": f"item-{index}",
+                "title": f"Article {index}",
+                "published": 1_700_000_000,
+                "canonical": [{"href": f"https://example.org/{index}"}],
+                "origin": {"title": "Example Journal"},
+            }
+
+        class _Response:
+            is_error = False
+            headers = {"X-Reader-Zone1-Limit": "100", "X-Reader-Zone1-Usage": "9"}
+
+            def __init__(self, payload): self._payload = payload
+            def json(self): return self._payload
+
+        class _Client:
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): return False
+
+            async def get(self, url, **kwargs):
+                if url.endswith("/tag/list"):
+                    return _Response({"tags": []})
+                calls["n"] += 1
+                start = (calls["n"] - 1) * 2
+                # Always offer another page, and always the same cursor.
+                return _Response(
+                    {"items": [item(start), item(start + 1)], "continuation": "same-cursor"}
+                )
+
+        with (
+            patch("backend.inoreader._valid_token", new=_fake_token),
+            patch("backend.inoreader.httpx.AsyncClient", new=lambda **kw: _Client()),
+        ):
+            articles, rate = asyncio.run(fetch_unread(7, max_items=4))
+
+        self.assertEqual(len(articles), 4)
+        self.assertEqual(rate["truncated"], "true")
+        self.assertEqual(rate["scan_limit"], "4")
+
+        # A repeated cursor must end the scan rather than loop forever.
+        calls["n"] = 0
+        with (
+            patch("backend.inoreader._valid_token", new=_fake_token),
+            patch("backend.inoreader.httpx.AsyncClient", new=lambda **kw: _Client()),
+        ):
+            articles, rate = asyncio.run(fetch_unread(7, max_items=1000))
+        self.assertEqual(rate["truncated"], "true")
+        self.assertLessEqual(calls["n"], 3)
 
     def test_inoreader_uses_only_confirmed_folder_labels(self) -> None:
         article = _article_from_item(
