@@ -247,13 +247,27 @@ def extract_elsevier_pii(url: str) -> str:
     return ""
 
 
+# A DOI suffix may legitimately contain a slash (10.21203/rs.3.rs-1/v1), so the
+# pattern has to allow one. That lets it run past the DOI and swallow the site's
+# own article id where a URL appends one, as Oxford University Press does in
+# /doi/10.1093/nsr/nwag496/8762552. A trailing run of bare digits is that id, not
+# part of the DOI -- a real suffix segment carries letters or a version marker.
+_TRAILING_SITE_ID = re.compile(r"/\d{4,}$")
+
+
+def _trim_site_id(doi: str) -> str:
+    trimmed = _TRAILING_SITE_ID.sub("", doi)
+    # Only accept the trim if a plausible multi-segment DOI remains.
+    return trimmed if "/" in trimmed.partition("/")[2] else doi
+
+
 def extract_doi(article: dict[str, Any]) -> str:
     haystack = " ".join(
         str(article.get(field, "")) for field in ("url", "title", "summary")
     )
     match = DOI_PATTERN.search(unquote(haystack))
     if match:
-        return match.group(0).rstrip(".,;)").casefold()
+        return _trim_site_id(match.group(0).rstrip(".,;)")).casefold()
     return derive_doi_from_url(str(article.get("url", "")))
 
 

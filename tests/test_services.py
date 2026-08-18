@@ -488,6 +488,35 @@ class ServiceTests(unittest.TestCase):
             extract_doi({"url": "https://www.researchsquare.com/article/rs-42/latest"}),
             "10.21203/rs.3.rs-42/v1",
         )
+        # OUP appends its own article id after the DOI; the greedy pattern would
+        # otherwise carry it along and every lookup would 404.
+        self.assertEqual(
+            extract_doi(
+                {
+                    "url": "https://academic.oup.com/nsr/advance-article/doi/"
+                    "10.1093/nsr/nwag496/8762552",
+                    "title": "A study",
+                    "summary": "",
+                }
+            ),
+            "10.1093/nsr/nwag496",
+        )
+        # A versioned preprint DOI ends in a marker, not bare digits, and must survive.
+        self.assertEqual(
+            extract_doi(
+                {
+                    "url": "https://www.researchsquare.com/article/rs-10515961/v2",
+                    "title": "A preprint",
+                    "summary": "",
+                }
+            ),
+            "10.21203/rs.3.rs-10515961/v2",
+        )
+        # A two-segment DOI must never be trimmed down to its prefix.
+        self.assertEqual(
+            extract_doi({"url": "https://example.org/x", "summary": "doi:10.1234/567890"}),
+            "10.1234/567890",
+        )
 
     def test_doi_batch_rejects_abstract_belonging_to_another_work(self) -> None:
         article = {"id": "a1", "title": "Perovskite solar cell interface passivation"}
