@@ -168,6 +168,10 @@ type DashboardData = {
     missing_summary_count: number;
     thin_summary_count: number;
     selected_count: number;
+    excluded_count: number;
+    complete_abstract_count: number;
+    excerpt_abstract_count: number;
+    idea_lab_count: number;
     estimated_cost: number;
     completed_at: string;
     note: string;
@@ -615,7 +619,8 @@ export default function PaperPulse() {
           <button className={view === "archive" ? "active" : ""} onClick={() => setView("archive")}><span>03</span> Brief archive <b>{data.archive.length}</b></button>
           <button onClick={() => setPanel("profile")}><span>04</span> Research profile</button>
           <button className={view === "learning" ? "active" : ""} onClick={() => setView("learning")}><span>05</span> Feedback learning</button>
-          <button onClick={() => setPanel("settings")}><span>06</span> Settings</button>
+          <button className={view === "pipeline" ? "active" : ""} onClick={() => setView("pipeline")}><span>06</span> Pipeline</button>
+          <button onClick={() => setPanel("settings")}><span>07</span> Settings</button>
         </nav>
 
         <div className="sidebar-bottom">
@@ -644,16 +649,16 @@ export default function PaperPulse() {
           </div>
         </header>
 
-        <section className="signal-strip" aria-label="Refresh summary">
+        {view !== "pipeline" && <section className="signal-strip" aria-label="Refresh summary">
           <div><span className="signal-number">{data.run?.scanned_count || 0}</span><span className="signal-label">feed items received</span></div>
           <div><span className="signal-number">{data.run?.unique_count || data.run?.scanned_count || 0}</span><span className="signal-label">unique works</span></div>
           <div><span className="signal-number">{data.run?.candidate_count || data.run?.selected_count || 0}</span><span className="signal-label">ranked candidates</span></div>
           <div><span className="signal-number accent">{data.run?.selected_count ?? data.recommendations.length}</span><span className="signal-label">articles delivered</span></div>
           <div><span className="signal-number">{formatEstimatedCost(data.run?.estimated_cost || 0)}</span><span className="signal-label">estimated AI cost</span></div>
           <div className="last-sync"><span className="pulse-live" />Updated {relativeTime(data.run?.completed_at)}</div>
-        </section>
+        </section>}
 
-        {data.run && (data.run.unique_count > 0 || data.run.candidate_count > 0) && <div className="data-quality-note">
+        {view !== "pipeline" && data.run && (data.run.unique_count > 0 || data.run.candidate_count > 0) && <div className="data-quality-note">
           <strong>Coverage:</strong> {data.run.duplicate_count || 0} duplicate feed entries merged · {data.recommendations.filter((item) => item.abstract_status === "complete").length}/{data.recommendations.length} selected articles with confirmed full abstracts · {data.run.missing_summary_count || 0} without any summary text
         </div>}
 
@@ -664,7 +669,59 @@ export default function PaperPulse() {
 
         {data.status.browser_last_error && <div className="browser-error-note"><strong>Browser abstract retrieval is unavailable:</strong> {data.status.browser_last_error}</div>}
 
-        <section className="content-grid">
+        {view === "pipeline" ? <section className="pipeline-panel" aria-label="Refresh pipeline">
+          {(() => {
+            const run = data.run;
+            if (!run) return <p className="pipeline-empty">No refresh has completed yet. Run a refresh to see how the pipeline narrowed your feed.</p>;
+            const scanned = run.scanned_count || 0;
+            const excluded = run.excluded_count || 0;
+            const unique = run.unique_count || 0;
+            const merged = run.duplicate_count || 0;
+            const complete = run.complete_abstract_count || 0;
+            const excerpt = run.excerpt_abstract_count || 0;
+            const candidates = run.candidate_count || 0;
+            const selected = run.selected_count ?? data.recommendations.length;
+            const deep = run.idea_lab_count || 0;
+            const legacy = unique > 0 && complete === 0 && excerpt === 0;
+            const stages = [
+              { key: "scanned", label: "Feed items received", value: scanned, note: "Unread items inside the scan window" },
+              { key: "kept", label: "Research works kept", value: Math.max(scanned - excluded, 0), note: excluded ? `${excluded} corrections, news and non-scholarly items removed` : "Nothing needed removing" },
+              { key: "unique", label: "Unique works", value: unique, note: merged ? `${merged} duplicate feed entries merged` : "No duplicates found" },
+              { key: "complete", label: "Full abstracts resolved", value: complete, note: excerpt ? `${excerpt} left with an excerpt only` : "" },
+              { key: "candidates", label: "Ranked candidates", value: candidates, note: "Scored against your research profile" },
+              { key: "selected", label: "Articles delivered", value: selected, note: "Your brief" },
+              { key: "deep", label: "Deep Idea Labs", value: deep, note: "Top-ranked articles with a verified abstract" },
+            ].filter((stage) => stage.value > 0 || stage.key === "deep");
+            const peak = Math.max(...stages.map((stage) => stage.value), 1);
+            return <>
+              <header className="pipeline-header">
+                <div>
+                  <h2>Refresh pipeline</h2>
+                  <p>How {scanned.toLocaleString()} feed items became {selected} articles · {relativeTime(run.completed_at)} · {formatEstimatedCost(run.estimated_cost || 0)}</p>
+                </div>
+              </header>
+              {legacy && <p className="pipeline-legacy">This refresh ran before abstract counts were recorded, so the abstract stage is not shown.</p>}
+              <ol className="funnel">
+                {stages.map((stage, index) => {
+                  const previous = index > 0 ? stages[index - 1].value : stage.value;
+                  const drop = previous - stage.value;
+                  return <li key={stage.key} className={stage.key === "selected" ? "funnel-step accent" : "funnel-step"}>
+                    <div className="funnel-head">
+                      <span className="funnel-label">{stage.label}</span>
+                      <span className="funnel-value">{stage.value.toLocaleString()}</span>
+                    </div>
+                    <div className="funnel-track"><div className="funnel-bar" style={{ width: `${Math.max((stage.value / peak) * 100, 1.5)}%` }} /></div>
+                    <div className="funnel-foot">
+                      {stage.note && <span>{stage.note}</span>}
+                      {index > 0 && drop > 0 && <span className="funnel-drop">&minus;{drop.toLocaleString()}</span>}
+                    </div>
+                  </li>;
+                })}
+              </ol>
+              {run.note && <details className="pipeline-note"><summary>Run log</summary><p>{run.note}</p></details>}
+            </>;
+          })()}
+        </section> : <section className="content-grid">
           <div className="feed-column">
             <div className="filter-row">
               <div className="filter-tabs" role="tablist" aria-label="Recommendation label">
@@ -764,7 +821,7 @@ export default function PaperPulse() {
               <p>The selected labels can overlap; the target article count is exact when enough unique candidates exist.</p>
             </section>
           </aside>
-        </section>
+        </section>}
       </main>
 
       {panel && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && setPanel(null)}>

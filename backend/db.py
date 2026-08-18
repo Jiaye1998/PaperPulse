@@ -178,6 +178,12 @@ def init_db() -> None:
             "candidate_count",
             "missing_summary_count",
             "thin_summary_count",
+            # Funnel stages the run note only ever described in prose. Runs
+            # recorded before this stay at 0 and the page marks them incomplete.
+            "excluded_count",
+            "complete_abstract_count",
+            "excerpt_abstract_count",
+            "idea_lab_count",
         ):
             if column not in refresh_columns:
                 db.execute(
@@ -564,6 +570,10 @@ def complete_refresh_run(
     candidate_count: int = 0,
     missing_summary_count: int = 0,
     thin_summary_count: int = 0,
+    excluded_count: int = 0,
+    complete_abstract_count: int = 0,
+    excerpt_abstract_count: int = 0,
+    idea_lab_count: int = 0,
 ) -> None:
     unique_count = scanned_count if unique_count is None else unique_count
     with connection() as db:
@@ -572,6 +582,8 @@ def complete_refresh_run(
             UPDATE refresh_runs SET completed_at = ?, status = ?, scanned_count = ?,
                 unique_count = ?, duplicate_count = ?, candidate_count = ?,
                 missing_summary_count = ?, thin_summary_count = ?, selected_count = ?,
+                excluded_count = ?, complete_abstract_count = ?,
+                excerpt_abstract_count = ?, idea_lab_count = ?,
                 estimated_cost = ?, note = ? WHERE id = ?
             """,
             (
@@ -584,6 +596,10 @@ def complete_refresh_run(
                 missing_summary_count,
                 thin_summary_count,
                 selected_count,
+                excluded_count,
+                complete_abstract_count,
+                excerpt_abstract_count,
+                idea_lab_count,
                 estimated_cost,
                 note,
                 refresh_id,

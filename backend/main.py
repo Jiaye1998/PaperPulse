@@ -319,6 +319,9 @@ async def refresh() -> dict[str, object]:
     try:
         settings = get_settings()
         refresh_id = create_refresh_run()
+        # The demo path never enriches abstracts, so the funnel counters need a
+        # value before either branch runs.
+        abstract_stats: dict[str, object] = {}
         try:
             profile_payload = get_profile()
             live_connection = connected()
@@ -455,6 +458,10 @@ async def refresh() -> dict[str, object]:
                 candidate_count=candidate_count,
                 missing_summary_count=ingest_stats["missing_summary_count"],
                 thin_summary_count=ingest_stats["thin_summary_count"],
+                excluded_count=int(ingest_stats.get("non_research_count", 0)),
+                complete_abstract_count=int(abstract_stats.get("complete", 0)),
+                excerpt_abstract_count=int(abstract_stats.get("excerpt", 0)),
+                idea_lab_count=idea_lab_count,
             )
             return dashboard()
         except Exception as error:
