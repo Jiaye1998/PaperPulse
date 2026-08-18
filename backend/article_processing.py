@@ -94,6 +94,26 @@ NON_RESEARCH_TITLE_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
 # content rather than peer-reviewed articles.
 NON_RESEARCH_URL_RULE = re.compile(r"/articles/d\d{5}-", re.IGNORECASE)
 
+# Hosts that never publish a research abstract. A subscription to them is a
+# reading choice, but inside this pipeline their items can only ever be excerpts:
+# they are ineligible for evidence-grounded analysis, yet still consume embedding
+# calls and can occupy a shortlist slot that a paper would otherwise take.
+NON_SCHOLARLY_HOSTS = (
+    "youtube.com",
+    "youtu.be",
+    "vimeo.com",
+    "phys.org",
+    "wired.com",
+    "npr.org",
+    "wsj.com",
+    "cnn.com",
+    "bbc.co.uk",
+    "nytimes.com",
+    "sciencealert.com",
+    "smithsonianmag.com",
+    "techcrunch.com",
+)
+
 # Preprint servers. On these hosts a Crossref "posted-content" record is the work
 # itself, not a stray earlier version of some journal article.
 PREPRINT_HOSTS = (
@@ -122,8 +142,12 @@ def non_research_kind(article: dict[str, Any]) -> str:
     for kind, pattern in NON_RESEARCH_TITLE_RULES:
         if pattern.search(title):
             return kind
-    if NON_RESEARCH_URL_RULE.search(str(article.get("url", ""))):
+    url = str(article.get("url", ""))
+    if NON_RESEARCH_URL_RULE.search(url):
         return "news"
+    host = (urlparse(url).hostname or "").casefold()
+    if any(host == name or host.endswith(f".{name}") for name in NON_SCHOLARLY_HOSTS):
+        return "non_scholarly_source"
     return ""
 
 

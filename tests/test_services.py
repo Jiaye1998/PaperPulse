@@ -275,6 +275,25 @@ class ServiceTests(unittest.TestCase):
                 f"should be kept: {title}",
             )
 
+        # Video and general-news subscriptions can never yield a research abstract.
+        for url in (
+            "https://www.youtube.com/watch?v=abc123",
+            "https://phys.org/news/2026-08-quantum.html",
+            "https://www.wired.com/story/some-story",
+        ):
+            self.assertEqual(
+                non_research_kind({"title": "A plausible science headline", "url": url}),
+                "non_scholarly_source",
+                f"should be excluded: {url}",
+            )
+        # A publisher host that merely contains a listed name must survive.
+        self.assertEqual(
+            non_research_kind(
+                {"title": "Real study", "url": "https://pubs.acs.org/doi/10.1021/x"}
+            ),
+            "",
+        )
+
         # Nature reserves the d##### DOI family for magazine content.
         self.assertEqual(
             non_research_kind(
