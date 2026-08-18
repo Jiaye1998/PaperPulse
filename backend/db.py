@@ -16,12 +16,19 @@ ARTICLE_ENCRYPTED_FIELDS = {
     "raw_json", "embedding_json",
 }
 RECOMMENDATION_ENCRYPTED_FIELDS = {
-    "reason", "core_finding", "innovation", "connection", "idea", "labels_json",
+    "reason", "core_finding", "innovation", "connection", "idea", "evidence",
+    "research_structure_json", "labels_json",
 }
+IDEA_LAB_ENCRYPTED_FIELDS = {"lab_json", "error"}
 PROFILE_ENCRYPTED_FIELDS = {"filename", "original_text", "profile_json"}
 TOKEN_ENCRYPTED_FIELDS = {"access_token", "refresh_token", "scope"}
 FEEDBACK_ENCRYPTED_FIELDS = {"value"}
-SECURE_SETTINGS = {"source_preferences", "folder_preferences", "oauth_state"}
+SECURE_SETTINGS = {
+    "source_preferences",
+    "folder_preferences",
+    "oauth_state",
+    "browser_verification_required",
+}
 
 
 def utc_now() -> str:
@@ -93,6 +100,11 @@ def init_db() -> None:
             completed_at TEXT,
             status TEXT NOT NULL,
             scanned_count INTEGER NOT NULL DEFAULT 0,
+            unique_count INTEGER NOT NULL DEFAULT 0,
+            duplicate_count INTEGER NOT NULL DEFAULT 0,
+            candidate_count INTEGER NOT NULL DEFAULT 0,
+            missing_summary_count INTEGER NOT NULL DEFAULT 0,
+            thin_summary_count INTEGER NOT NULL DEFAULT 0,
             selected_count INTEGER NOT NULL DEFAULT 0,
             estimated_cost REAL NOT NULL DEFAULT 0,
             note TEXT NOT NULL DEFAULT ''
@@ -112,12 +124,28 @@ def init_db() -> None:
             innovation TEXT NOT NULL,
             connection TEXT NOT NULL,
             idea TEXT NOT NULL,
+            evidence TEXT NOT NULL DEFAULT '',
+            research_structure_json TEXT NOT NULL DEFAULT '{}',
             idea_is_speculative INTEGER NOT NULL DEFAULT 1,
             labels_json TEXT NOT NULL DEFAULT '[]',
             created_at TEXT NOT NULL,
             PRIMARY KEY (refresh_id, article_id),
             FOREIGN KEY (refresh_id) REFERENCES refresh_runs(id),
             FOREIGN KEY (article_id) REFERENCES articles(id)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS idea_labs (
+            refresh_id INTEGER NOT NULL,
+            article_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            lab_json TEXT NOT NULL DEFAULT '{}',
+            estimated_cost REAL NOT NULL DEFAULT 0,
+            generated_at TEXT NOT NULL,
+            error TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (refresh_id, article_id),
+            FOREIGN KEY (refresh_id) REFERENCES refresh_runs(id) ON DELETE CASCADE,
+            FOREIGN KEY (article_id) REFERENCES articles(id) ON DELETE CASCADE
         )
         """,
         """
@@ -140,6 +168,34 @@ def init_db() -> None:
         }
         if "embedding_model" not in article_columns:
             db.execute("ALTER TABLE articles ADD COLUMN embedding_model TEXT")
+        refresh_columns = {
+            str(row["name"])
+            for row in db.execute("PRAGMA table_info(refresh_runs)").fetchall()
+        }
+        for column in (
+            "unique_count",
+            "duplicate_count",
+            "candidate_count",
+            "missing_summary_count",
+            "thin_summary_count",
+        ):
+            if column not in refresh_columns:
+                db.execute(
+                    f"ALTER TABLE refresh_runs ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"
+                )
+        recommendation_columns = {
+            str(row["name"])
+            for row in db.execute("PRAGMA table_info(recommendations)").fetchall()
+        }
+        if "evidence" not in recommendation_columns:
+            db.execute(
+                "ALTER TABLE recommendations ADD COLUMN evidence TEXT NOT NULL DEFAULT ''"
+            )
+        if "research_structure_json" not in recommendation_columns:
+            db.execute(
+                "ALTER TABLE recommendations ADD COLUMN "
+                "research_structure_json TEXT NOT NULL DEFAULT '{}'"
+            )
         defaults = {
             "top_n": "20",
             "first_sync_days": "7",
@@ -166,6 +222,7 @@ def _migrate_encrypted_columns(db: sqlite3.Connection) -> None:
         ("oauth_tokens", TOKEN_ENCRYPTED_FIELDS),
         ("articles", ARTICLE_ENCRYPTED_FIELDS),
         ("recommendations", RECOMMENDATION_ENCRYPTED_FIELDS),
+        ("idea_labs", IDEA_LAB_ENCRYPTED_FIELDS),
         ("feedback", FEEDBACK_ENCRYPTED_FIELDS),
     ):
         columns = ", ".join(fields)
@@ -346,7 +403,26 @@ def upsert_articles(articles: list[dict[str, Any]]) -> int:
     if not articles:
         return 0
     with connection() as db:
+        article_ids = [str(article["id"]) for article in articles]
+        placeholders = ",".join("?" for _ in article_ids)
+        existing_rows = db.execute(
+            f"SELECT id, title, summary FROM articles WHERE id IN ({placeholders})",
+            article_ids,
+        ).fetchall()
+        existing_content = {
+            str(row["id"]): (
+                decrypt_text(row["title"]),
+                decrypt_text(row["summary"]),
+            )
+            for row in existing_rows
+        }
         for article in articles:
+            old_content = existing_content.get(str(article["id"]))
+            content_changed = bool(
+                old_content
+                and old_content
+                != (str(article["title"]), str(article.get("summary", "")))
+            )
             db.execute(
                 """
                 INSERT INTO articles(
@@ -363,7 +439,9 @@ def upsert_articles(articles: list[dict[str, Any]]) -> int:
                     published_at = excluded.published_at,
                     folder = excluded.folder,
                     summary_quality = excluded.summary_quality,
-                    raw_json = excluded.raw_json
+                    raw_json = excluded.raw_json,
+                    embedding_json = CASE WHEN ? THEN NULL ELSE articles.embedding_json END,
+                    embedding_model = CASE WHEN ? THEN NULL ELSE articles.embedding_model END
                 """,
                 (
                     article["id"],
@@ -378,6 +456,8 @@ def upsert_articles(articles: list[dict[str, Any]]) -> int:
                     article.get("summary_quality", 0.5),
                     encrypt_text(json.dumps(article.get("raw", {}))),
                     utc_now(),
+                    int(content_changed),
+                    int(content_changed),
                 ),
             )
     return len(articles)
@@ -409,6 +489,15 @@ def _article_row(row: sqlite3.Row) -> dict[str, Any]:
     item = dict(row)
     for field in ARTICLE_ENCRYPTED_FIELDS:
         item[field] = decrypt_text(item.get(field))
+    try:
+        raw = json.loads(str(item.get("raw_json") or "{}"))
+    except json.JSONDecodeError:
+        raw = {}
+    item["raw"] = raw
+    folders = raw.get("folders") if isinstance(raw.get("folders"), list) else []
+    item["folders"] = folders or (
+        [item["folder"]] if item.get("folder") and item["folder"] != "Uncategorized" else []
+    )
     return item
 
 
@@ -469,17 +558,31 @@ def complete_refresh_run(
     selected_count: int,
     estimated_cost: float = 0,
     note: str = "",
+    *,
+    unique_count: int | None = None,
+    duplicate_count: int = 0,
+    candidate_count: int = 0,
+    missing_summary_count: int = 0,
+    thin_summary_count: int = 0,
 ) -> None:
+    unique_count = scanned_count if unique_count is None else unique_count
     with connection() as db:
         db.execute(
             """
             UPDATE refresh_runs SET completed_at = ?, status = ?, scanned_count = ?,
-                selected_count = ?, estimated_cost = ?, note = ? WHERE id = ?
+                unique_count = ?, duplicate_count = ?, candidate_count = ?,
+                missing_summary_count = ?, thin_summary_count = ?, selected_count = ?,
+                estimated_cost = ?, note = ? WHERE id = ?
             """,
             (
                 utc_now(),
                 status,
                 scanned_count,
+                unique_count,
+                duplicate_count,
+                candidate_count,
+                missing_summary_count,
+                thin_summary_count,
                 selected_count,
                 estimated_cost,
                 note,
@@ -498,8 +601,9 @@ def save_recommendations(
                 INSERT OR REPLACE INTO recommendations(
                     refresh_id, article_id, rank, relevance_score, novelty_score,
                     inspiration_score, confidence, reason, core_finding, innovation,
-                    connection, idea, idea_is_speculative, labels_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    connection, idea, evidence, research_structure_json,
+                    idea_is_speculative, labels_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     refresh_id,
@@ -514,6 +618,8 @@ def save_recommendations(
                     encrypt_text(rec["innovation"]),
                     encrypt_text(rec["connection"]),
                     encrypt_text(rec["idea"]),
+                    encrypt_text(rec.get("evidence", "")),
+                    encrypt_text(json.dumps(rec.get("research_structure", {}))),
                     int(rec.get("idea_is_speculative", True)),
                     encrypt_text(json.dumps(rec.get("labels", []))),
                     utc_now(),
@@ -533,6 +639,7 @@ def latest_dashboard() -> dict[str, Any]:
             """
             SELECT r.*, a.title, a.summary, a.source, a.source_url, a.url,
                    a.author, a.published_at, a.folder, a.summary_quality,
+                   a.raw_json,
                    f.value AS feedback
             FROM recommendations r
             JOIN articles a ON a.id = r.article_id
@@ -542,7 +649,7 @@ def latest_dashboard() -> dict[str, Any]:
             """,
             (run["id"],),
         ).fetchall()
-    recommendations = [_recommendation_row(row) for row in rows]
+    recommendations = _attach_idea_labs([_recommendation_row(row) for row in rows])
     return {"run": dict(run), "recommendations": recommendations}
 
 
@@ -552,10 +659,165 @@ def _recommendation_row(row: sqlite3.Row) -> dict[str, Any]:
         if field in item:
             item[field] = decrypt_text(item.get(field))
     item["labels"] = json.loads(str(item.pop("labels_json")))
+    try:
+        item["research_structure"] = json.loads(
+            str(item.pop("research_structure_json", "{}") or "{}")
+        )
+    except json.JSONDecodeError:
+        item["research_structure"] = {}
+    raw_json = item.pop("raw_json", "{}")
+    try:
+        raw = json.loads(str(raw_json or "{}"))
+    except json.JSONDecodeError:
+        raw = {}
+    for field in (
+        "work_type",
+        "publication_status",
+        "update_status",
+        "is_update",
+        "doi",
+        "arxiv_id",
+        "duplicate_count",
+        "summary_source",
+        "abstract_status",
+        "abstract_source_url",
+        "abstract_fetched_at",
+    ):
+        item[field] = raw.get(field)
+    item["folders"] = raw.get("folders") or (
+        [item["folder"]] if item.get("folder") and item["folder"] != "Uncategorized" else []
+    )
+    item["labels"] = [
+        "Emerging signal" if label == "Frontier" else label for label in item["labels"]
+    ]
     if "feedback" in item:
         item["feedback"] = decrypt_text(item.get("feedback"))
     item["idea_is_speculative"] = bool(item["idea_is_speculative"])
     return item
+
+
+def _idea_lab_row(row: sqlite3.Row) -> dict[str, Any]:
+    item = dict(row)
+    for field in IDEA_LAB_ENCRYPTED_FIELDS:
+        item[field] = decrypt_text(item.get(field))
+    try:
+        lab = json.loads(str(item.get("lab_json") or "{}"))
+    except json.JSONDecodeError:
+        lab = {}
+    return {
+        **lab,
+        "status": item.get("status", "failed"),
+        "estimated_cost": float(item.get("estimated_cost") or 0),
+        "generated_at": item.get("generated_at"),
+        "error": item.get("error", ""),
+    }
+
+
+def _attach_idea_labs(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not items:
+        return items
+    labs: dict[tuple[int, str], dict[str, Any]] = {}
+    with connection() as db:
+        for start in range(0, len(items), 400):
+            batch = items[start : start + 400]
+            refresh_ids = sorted({int(item["refresh_id"]) for item in batch})
+            article_ids = sorted({str(item["article_id"]) for item in batch})
+            refresh_marks = ",".join("?" for _ in refresh_ids)
+            article_marks = ",".join("?" for _ in article_ids)
+            rows = db.execute(
+                f"SELECT * FROM idea_labs WHERE refresh_id IN ({refresh_marks}) "
+                f"AND article_id IN ({article_marks})",
+                [*refresh_ids, *article_ids],
+            ).fetchall()
+            labs.update(
+                {
+                    (int(row["refresh_id"]), str(row["article_id"])): _idea_lab_row(row)
+                    for row in rows
+                }
+            )
+    for item in items:
+        lab = labs.get((int(item["refresh_id"]), str(item["article_id"])))
+        item["idea_lab"] = lab
+        if lab and not item.get("research_structure") and lab.get("research_structure"):
+            item["research_structure"] = lab["research_structure"]
+    return items
+
+
+def save_idea_lab(
+    refresh_id: int,
+    article_id: str,
+    status: str,
+    lab: dict[str, Any] | None = None,
+    estimated_cost: float = 0,
+    error: str = "",
+) -> dict[str, Any]:
+    generated_at = utc_now()
+    with connection() as db:
+        db.execute(
+            """
+            INSERT INTO idea_labs(
+                refresh_id, article_id, status, lab_json, estimated_cost,
+                generated_at, error
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(refresh_id, article_id) DO UPDATE SET
+                status = excluded.status,
+                lab_json = excluded.lab_json,
+                estimated_cost = excluded.estimated_cost,
+                generated_at = excluded.generated_at,
+                error = excluded.error
+            """,
+            (
+                refresh_id,
+                article_id,
+                status,
+                encrypt_text(json.dumps(lab or {}, ensure_ascii=False)),
+                estimated_cost,
+                generated_at,
+                encrypt_text(error),
+            ),
+        )
+    return {
+        **(lab or {}),
+        "status": status,
+        "estimated_cost": estimated_cost,
+        "generated_at": generated_at,
+        "error": error,
+    }
+
+
+def get_idea_lab(refresh_id: int, article_id: str) -> dict[str, Any] | None:
+    with connection() as db:
+        row = db.execute(
+            "SELECT * FROM idea_labs WHERE refresh_id = ? AND article_id = ?",
+            (refresh_id, article_id),
+        ).fetchone()
+    return _idea_lab_row(row) if row else None
+
+
+def idea_lab_context(refresh_id: int, article_id: str) -> dict[str, Any] | None:
+    with connection() as db:
+        row = db.execute(
+            """
+            SELECT r.*, a.title, a.summary, a.source, a.source_url, a.url,
+                   a.author, a.published_at, a.folder, a.summary_quality,
+                   a.raw_json, NULL AS feedback
+            FROM recommendations r
+            JOIN articles a ON a.id = r.article_id
+            WHERE r.refresh_id = ? AND r.article_id = ?
+            """,
+            (refresh_id, article_id),
+        ).fetchone()
+    return _recommendation_row(row) if row else None
+
+
+def add_refresh_cost(refresh_id: int, amount: float) -> None:
+    if amount <= 0:
+        return
+    with connection() as db:
+        db.execute(
+            "UPDATE refresh_runs SET estimated_cost = estimated_cost + ? WHERE id = ?",
+            (amount, refresh_id),
+        )
 
 
 def feedback_recommendations(values: set[str] | None = None, limit: int = 200) -> list[dict[str, Any]]:
@@ -569,6 +831,7 @@ def feedback_recommendations(values: set[str] | None = None, limit: int = 200) -
             )
             SELECT r.*, a.title, a.summary, a.source, a.source_url, a.url,
                    a.author, a.published_at, a.folder, a.summary_quality,
+                   a.raw_json,
                    f.value AS feedback
             FROM feedback f
             JOIN articles a ON a.id = f.article_id
@@ -579,7 +842,7 @@ def feedback_recommendations(values: set[str] | None = None, limit: int = 200) -
             LIMIT 2000
             """
         ).fetchall()
-    items = [_recommendation_row(row) for row in rows]
+    items = _attach_idea_labs([_recommendation_row(row) for row in rows])
     if values:
         items = [item for item in items if item.get("feedback") in values]
     return items[:limit]
@@ -598,6 +861,7 @@ def archive_recommendations(
             f"""
             SELECT r.*, a.title, a.summary, a.source, a.source_url, a.url,
                    a.author, a.published_at, a.folder, a.summary_quality,
+                   a.raw_json,
                    f.value AS feedback, rr.completed_at AS run_completed_at,
                    rr.status AS run_status
             FROM recommendations r
@@ -610,7 +874,7 @@ def archive_recommendations(
             """,
             params,
         ).fetchall()
-    items = [_recommendation_row(row) for row in rows]
+    items = _attach_idea_labs([_recommendation_row(row) for row in rows])
     normalized = query.strip().casefold()
     if normalized:
         fields = (
@@ -640,17 +904,25 @@ def refresh_history(limit: int = 100) -> list[dict[str, Any]]:
 
 def source_catalog() -> dict[str, list[str]]:
     with connection() as db:
-        rows = db.execute("SELECT source, folder FROM articles").fetchall()
+        rows = db.execute("SELECT source, folder, raw_json FROM articles").fetchall()
     sources = {
         str(decrypt_text(row["source"]))
         for row in rows
         if decrypt_text(row["source"])
     }
-    folders = {
-        str(decrypt_text(row["folder"]))
-        for row in rows
-        if decrypt_text(row["folder"])
-    }
+    folders: set[str] = set()
+    for row in rows:
+        try:
+            raw = json.loads(str(decrypt_text(row["raw_json"]) or "{}"))
+        except json.JSONDecodeError:
+            raw = {}
+        raw_folders = raw.get("folders") if isinstance(raw.get("folders"), list) else []
+        if raw_folders:
+            folders.update(str(folder) for folder in raw_folders if folder)
+        else:
+            folder = str(decrypt_text(row["folder"]) or "")
+            if folder and folder != "Uncategorized":
+                folders.add(folder)
     return {"sources": sorted(sources), "folders": sorted(folders)}
 
 

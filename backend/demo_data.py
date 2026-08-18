@@ -173,7 +173,7 @@ def ensure_demo_data() -> None:
                 "published_at": (now - timedelta(hours=index * 3 + 1)).isoformat(),
                 "folder": item["folder"],
                 "summary_quality": 0.92,
-                "raw": {"demo": True},
+                "raw": {"demo": True, "summary_source": "demo_abstract"},
             }
         )
         relevance, novelty, inspiration, confidence = item["scores"]
@@ -205,4 +205,3 @@ def ensure_demo_data() -> None:
         estimated_cost=0.18,
         note="Sample data — connect Inoreader and upload a CV to personalize PaperPulse.",
     )
-

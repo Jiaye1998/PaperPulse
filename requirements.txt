@@ -8,5 +8,6 @@ python-multipart>=0.0.20,<1
 pypdf>=6,<7
 python-docx>=1.2,<2
 beautifulsoup4>=4.13,<5
+playwright>=1.54,<2
 numpy>=2.2,<3
 cryptography>=48,<49
