@@ -205,13 +205,36 @@ def _title_matches(requested_title: str, page_title: str) -> bool:
     return overlap >= 0.45
 
 
+def _plain_title(value: str) -> str:
+    """Strip the markup Crossref keeps inside a title.
+
+    Chemistry and materials titles arrive as "Sn-alloyed <b>ε</b>-Ga<sub>2</sub>",
+    and normalising that directly turns the tag names into words: "b" and "sub"
+    become title tokens and no comparison can succeed.
+    """
+    if "<" not in value and "&" not in value:
+        return value
+    return BeautifulSoup(html.unescape(value), "html.parser").get_text(" ", strip=True)
+
+
 def _metadata_title_matches(requested_title: str, result_title: str) -> bool:
-    requested_text = normalize_title(requested_title)
-    result_text = normalize_title(result_title)
+    requested_text = normalize_title(_plain_title(requested_title))
+    result_text = normalize_title(_plain_title(result_title))
     if not requested_text or not result_text:
         return False
     if requested_text == result_text:
         return True
+    # Feeds that render subscripts as separate characters turn "Ga2O3" into
+    # "Ga 2 O 3", which is one token against four and wrecks any word-overlap
+    # ratio. Comparing without spacing recognises the same title, and also lets a
+    # feed title that stops early match the full record.
+    requested_dense = requested_text.replace(" ", "")
+    result_dense = result_text.replace(" ", "")
+    if len(requested_dense) >= 24 and len(result_dense) >= 24:
+        if requested_dense.startswith(result_dense) or result_dense.startswith(
+            requested_dense
+        ):
+            return True
     requested = set(requested_text.split())
     result = set(result_text.split())
     return len(requested & result) / max(len(requested), len(result)) >= 0.82
@@ -536,8 +559,14 @@ async def _crossref_doi_batch(
     client: httpx.AsyncClient,
     gate: _ServiceGate,
     targets: dict[str, dict[str, Any]],
+    seen: set[str] | None = None,
 ) -> dict[str, AbstractCandidate]:
-    """Resolve many DOIs per request; same-name Crossref filters are OR-ed."""
+    """Resolve many DOIs per request; same-name Crossref filters are OR-ed.
+
+    Records every DOI Crossref answered for, including those with no abstract:
+    searching the same index by title for a work it has already described cannot
+    produce anything new.
+    """
     found: dict[str, AbstractCandidate] = {}
     for chunk in _chunked(sorted(targets), CROSSREF_BATCH_SIZE):
         payload = await _get_json(
@@ -558,6 +587,8 @@ async def _crossref_doi_batch(
             if not isinstance(work, dict):
                 continue
             doi = str(work.get("DOI") or "").casefold()
+            if seen is not None and doi:
+                seen.add(doi)
             article = targets.get(doi)
             if article is None:
                 continue
@@ -803,6 +834,7 @@ async def _resolve_by_doi(
     articles: Iterable[dict[str, Any]],
     resolved: dict[str, AbstractCandidate],
     stats: dict[str, Any],
+    crossref_seen: set[str] | None = None,
 ) -> None:
     """Walk the DOI-keyed services in order, carrying only the still-missing works."""
     targets: dict[str, dict[str, Any]] = {}
@@ -819,7 +851,10 @@ async def _resolve_by_doi(
         }
         if not pending:
             break
-        found = await resolver(client, gates[name], pending)
+        if name == "crossref":
+            found = await resolver(client, gates[name], pending, crossref_seen)
+        else:
+            found = await resolver(client, gates[name], pending)
         stats[f"{name}_batch_hits"] = len(found)
         resolved.update(found)
 
@@ -830,14 +865,20 @@ async def _resolve_by_title(
     articles: list[dict[str, Any]],
     resolved: dict[str, AbstractCandidate],
     stats: dict[str, Any],
+    crossref_seen: set[str] | None = None,
 ) -> None:
-    """Last metadata resort for works whose DOI is unknown, one query each."""
-    pending = [
+    """Last metadata resort, one query each, for works Crossref has not described."""
+    described = crossref_seen or set()
+    eligible = [
         article
         for article in articles
-        if str(article["id"]) not in resolved and str(article.get("title", "")).strip()
-    ][:TITLE_SEARCH_LIMIT]
+        if str(article["id"]) not in resolved
+        and str(article.get("title", "")).strip()
+        and str((article.get("raw") or {}).get("doi") or "").casefold() not in described
+    ]
+    pending = eligible[:TITLE_SEARCH_LIMIT]
     stats["title_search_attempted"] = len(pending)
+    stats["title_search_skipped_over_limit"] = len(eligible) - len(pending)
     hits = 0
     for article in pending:
         title = str(article.get("title", ""))
@@ -1072,8 +1113,9 @@ async def enrich_articles_with_public_abstracts(
             headers=headers,
         ) as client:
             await _resolve_elsevier_dois(client, gates["crossref"], pending, stats)
-            await _resolve_by_doi(client, gates, pending, resolved, stats)
-            await _resolve_by_title(client, gates, pending, resolved, stats)
+            crossref_seen: set[str] = set()
+            await _resolve_by_doi(client, gates, pending, resolved, stats, crossref_seen)
+            await _resolve_by_title(client, gates, pending, resolved, stats, crossref_seen)
             await _resolve_publisher_pages(
                 client, pending, resolved, blocked_hosts, stats
             )

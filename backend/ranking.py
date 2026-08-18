@@ -507,6 +507,7 @@ def _default_scores(article: dict[str, Any], ranking_mode: str) -> dict[str, Any
     relevance = max(0.25, min(0.92, float(article.get("profile_similarity", 0.5))))
     inspiration = max(0.35, min(0.86, relevance + (0.12 if ranking_mode == "exploratory" else 0.04)))
     raw = article.get("raw") if isinstance(article.get("raw"), dict) else {}
+    response = None
     novelty = 0.45 if raw.get("is_update") else 0.62
     labels: list[str] = []
     if relevance >= 0.55:
@@ -592,11 +593,17 @@ def _analyze_one(
     article: dict[str, Any],
     scores: dict[str, Any],
     profile_text: str,
-) -> tuple[dict[str, Any], float, bool]:
+) -> tuple[dict[str, Any], float, str]:
+    """Analyse one article, reporting which gate rejected it when one does.
+
+    Four of the outcomes are the safety checks doing their job and one is an
+    operational fault; collapsing them into a single boolean made a run of
+    fallbacks impossible to tell apart.
+    """
     summary, summary_provenance = source_abstract(article)
     fallback = _fallback_analysis(article, scores)
     if len(summary.strip()) < 40:
-        return fallback, 0.0, False
+        return fallback, 0.0, "no verified abstract"
     raw = article.get("raw") if isinstance(article.get("raw"), dict) else {}
     try:
         client = OpenAI(api_key=config.openai_api_key)
@@ -659,18 +666,18 @@ def _analyze_one(
         )
         payload = json.loads(response.output_text)
         if str(payload.get("candidate_key")) != str(article["candidate_key"]):
-            return fallback, _usage_cost(response), False
+            return fallback, _usage_cost(response), "wrong candidate key"
         if normalize_title(str(payload.get("article_title", ""))) != normalize_title(
             str(article["title"])
         ):
-            return fallback, _usage_cost(response), False
+            return fallback, _usage_cost(response), "wrong article title"
         evidence = str(payload.get("evidence", ""))
         if not evidence_is_grounded(evidence, summary[:6_000]):
-            return fallback, _usage_cost(response), False
+            return fallback, _usage_cost(response), "evidence not verbatim"
         if not claim_is_supported(
             str(payload.get("core_finding", "")), evidence, summary[:6_000]
         ):
-            return fallback, _usage_cost(response), False
+            return fallback, _usage_cost(response), "claim unsupported"
         research_structure = _sanitize_research_structure(
             payload.get("research_structure"), summary[:6_000]
         )
@@ -690,9 +697,11 @@ def _analyze_one(
             idea_is_speculative=True,
             labels=list(scores.get("labels") or []),
         ).model_dump()
-        return recommendation, _usage_cost(response), True
+        return recommendation, _usage_cost(response), ""
     except Exception:
-        return fallback, 0.0, False
+        # A call that succeeded before a later step raised was still billed.
+        spent = _usage_cost(response) if response is not None else 0.0
+        return fallback, spent, "analysis error"
 
 
 def _select_valid_recommendations(
@@ -875,6 +884,7 @@ def rank_articles(
     recommendations: list[dict[str, Any] | None] = [None] * len(selected)
     analysis_cost = 0.0
     grounded_count = 0
+    rejections: Counter[str] = Counter()
     profile_text = _profile_text(profile)
     with ThreadPoolExecutor(max_workers=min(4, max(1, len(selected)))) as executor:
         futures = {
@@ -883,10 +893,13 @@ def rank_articles(
         }
         for future in as_completed(futures):
             index = futures[future]
-            recommendation, cost, grounded = future.result()
+            recommendation, cost, rejection = future.result()
             recommendations[index] = recommendation
             analysis_cost += cost
-            grounded_count += int(grounded)
+            if rejection:
+                rejections[rejection] += 1
+            else:
+                grounded_count += 1
 
     final_recommendations = [item for item in recommendations if item is not None]
     complete_abstract_count = sum(
@@ -897,6 +910,14 @@ def rank_articles(
         f"Ranked {candidate_count} unique candidates and returned exactly "
         f"{len(final_recommendations)} of {target_n} requested articles; "
         f"{complete_abstract_count} selected articles had confirmed complete abstracts; "
-        f"{grounded_count} analyses passed verbatim-evidence validation."
+        f"{grounded_count} analyses passed verbatim-evidence validation"
+        + (
+            " (fell back on "
+            + ", ".join(f"{reason} {count}" for reason, count in sorted(rejections.items()))
+            + ")"
+            if rejections
+            else ""
+        )
+        + "."
     )
     return final_recommendations, selection_cost + analysis_cost, note, candidate_count

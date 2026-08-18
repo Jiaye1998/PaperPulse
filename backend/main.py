@@ -308,12 +308,20 @@ async def inoreader_callback(code: str = "", state: str = "", error: str = "") -
 
 @app.post("/api/refresh")
 async def refresh() -> dict[str, object]:
+    # Checking and then acquiring lets two simultaneous callers both pass the
+    # check and queue up, running two full refreshes instead of rejecting one.
     if refresh_lock.locked():
         raise HTTPException(409, "A refresh is already in progress.")
-
-    async with refresh_lock:
+    try:
+        await asyncio.wait_for(refresh_lock.acquire(), timeout=0.01)
+    except (asyncio.TimeoutError, TimeoutError):
+        raise HTTPException(409, "A refresh is already in progress.") from None
+    try:
         settings = get_settings()
         refresh_id = create_refresh_run()
+        # The demo path never enriches abstracts, so the funnel counters need a
+        # value before either branch runs.
+        abstract_stats: dict[str, object] = {}
         try:
             profile_payload = get_profile()
             live_connection = connected()
@@ -324,6 +332,7 @@ async def refresh() -> dict[str, object]:
                     )
                 purge_demo_data()
                 raw_incoming, rate = await fetch_unread(settings["first_sync_days"])
+                set_setting("inoreader_last_error", "")
                 incoming, ingest_stats = deduplicate_articles(raw_incoming)
                 cached_articles = get_articles_by_ids(
                     [str(article["id"]) for article in incoming]
@@ -352,6 +361,11 @@ async def refresh() -> dict[str, object]:
                     f"Inoreader zone 1 usage: {rate.get('usage') or '—'} / "
                     f"{rate.get('limit') or '—'}"
                 )
+                if abstract_stats.get("title_search_skipped_over_limit"):
+                    source_note += (
+                        f"; {abstract_stats['title_search_skipped_over_limit']} works "
+                        f"passed the title-search limit unqueried"
+                    )
                 if rate.get("truncated"):
                     source_note += (
                         f"; WARNING: more unread items exist than the "
@@ -444,12 +458,18 @@ async def refresh() -> dict[str, object]:
                 candidate_count=candidate_count,
                 missing_summary_count=ingest_stats["missing_summary_count"],
                 thin_summary_count=ingest_stats["thin_summary_count"],
+                excluded_count=int(ingest_stats.get("non_research_count", 0)),
+                complete_abstract_count=int(abstract_stats.get("complete", 0)),
+                excerpt_abstract_count=int(abstract_stats.get("excerpt", 0)),
+                idea_lab_count=idea_lab_count,
             )
             return dashboard()
         except Exception as error:
             complete_refresh_run(refresh_id, "failed", 0, 0, note=str(error))
             status_code = 400 if isinstance(error, InoreaderConfigurationError) else 502
             raise HTTPException(status_code, str(error)) from error
+    finally:
+        refresh_lock.release()
 
 
 @app.post("/api/articles/{article_id:path}/feedback")
