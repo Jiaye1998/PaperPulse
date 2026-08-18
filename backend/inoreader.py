@@ -289,6 +289,8 @@ async def fetch_unread(unread_window_days: int = 7, max_items: int = 1000) -> tu
         except (httpx.HTTPError, ValueError):
             # Folder metadata improves organization but should not block article refresh.
             known_folders = None
+        truncated = False
+        seen_continuations: set[str] = set()
         while len(articles) < max_items:
             response = await client.get(endpoint, params=params, headers=headers)
             if response.is_error:
@@ -307,8 +309,20 @@ async def fetch_unread(unread_window_days: int = 7, max_items: int = 1000) -> tu
                 "usage": response.headers.get("X-Reader-Zone1-Usage", ""),
                 "reset_after": response.headers.get("X-Reader-Limits-Reset-After", ""),
             }
-            continuation = payload.get("continuation")
-            if not continuation or len(articles) >= max_items:
+            continuation = str(payload.get("continuation") or "")
+            if not continuation:
                 break
+            if len(articles) >= max_items:
+                # More unread items exist than this refresh will look at. Silently
+                # dropping them hides articles from ranking, so say so instead.
+                truncated = True
+                break
+            if continuation in seen_continuations:
+                # A repeated cursor would otherwise spin here forever.
+                truncated = True
+                break
+            seen_continuations.add(continuation)
             params["c"] = continuation
+    rate["truncated"] = "true" if truncated else ""
+    rate["scan_limit"] = str(max_items)
     return articles[:max_items], rate

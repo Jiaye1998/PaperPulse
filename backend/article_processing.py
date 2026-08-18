@@ -32,6 +32,14 @@ _URL_DOI_RULES: tuple[tuple[re.Pattern[str], re.Pattern[str], str], ...] = (
         re.compile(r"/content/(10\.1101/[^/?#]+?)(?:\.full|\.abstract)?/?$", re.IGNORECASE),
         "{0}",
     ),
+    (
+        # An RSC article URL ends in the DOI suffix itself, e.g.
+        # /en/content/articlelanding/2026/cc/d6cc03277j -> 10.1039/d6cc03277j
+        re.compile(r"(?:^|\.)rsc\.org$", re.IGNORECASE),
+        re.compile(r"/content/article[a-z]*/\d{4}/[a-z]{2,3}/([a-z]\d[a-z]{2}\d{4,6}[a-z])",
+                   re.IGNORECASE),
+        "10.1039/{0}",
+    ),
 )
 
 
@@ -85,6 +93,27 @@ NON_RESEARCH_TITLE_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
 # Nature reserves the d##### DOI family for news, features, and other magazine
 # content rather than peer-reviewed articles.
 NON_RESEARCH_URL_RULE = re.compile(r"/articles/d\d{5}-", re.IGNORECASE)
+
+# Preprint servers. On these hosts a Crossref "posted-content" record is the work
+# itself, not a stray earlier version of some journal article.
+PREPRINT_HOSTS = (
+    "arxiv.org",
+    "biorxiv.org",
+    "chemrxiv.org",
+    "medrxiv.org",
+    "osf.io",
+    "preprints.org",
+    "researchsquare.com",
+    "ssrn.com",
+    "techrxiv.org",
+)
+
+
+def is_preprint_source(article: dict[str, Any]) -> bool:
+    host = (urlparse(str(article.get("url", ""))).hostname or "").casefold()
+    return bool(extract_arxiv_id(article)) or any(
+        host == name or host.endswith(f".{name}") for name in PREPRINT_HOSTS
+    )
 
 
 def non_research_kind(article: dict[str, Any]) -> str:
@@ -169,21 +198,29 @@ def derive_doi_from_url(url: str) -> str:
     return ""
 
 
-PII_PATTERN = re.compile(r"/science/article/(?:abs/|pii/)?pii/([A-Z0-9]{17})", re.IGNORECASE)
+# Elsevier hosts key their article URLs by PII rather than DOI. ScienceDirect
+# writes it compactly; the society sites punctuate it (S0092-8674(26)00828-7).
+ELSEVIER_PII_HOSTS = ("sciencedirect.com", "cell.com", "thelancet.com")
+PII_PATTERN = re.compile(r"S[0-9X()\-]{15,26}", re.IGNORECASE)
 
 
 def extract_elsevier_pii(url: str) -> str:
-    """Return the PII in a ScienceDirect URL.
+    """Return the PII in an Elsevier article URL.
 
     Elsevier feeds carry no DOI and its article URLs are keyed by PII instead, so
     the PII is the only identifier available for these works. Crossref indexes it
     as an alternative-id, which makes it resolvable to the real DOI.
     """
     parsed = urlparse(url or "")
-    if "sciencedirect.com" not in (parsed.hostname or "").casefold():
+    host = (parsed.hostname or "").casefold()
+    if not any(host == name or host.endswith(f".{name}") for name in ELSEVIER_PII_HOSTS):
         return ""
-    match = PII_PATTERN.search(unquote(parsed.path))
-    return match.group(1).upper() if match else ""
+    target = unquote(parsed.path) + "?" + unquote(parsed.query)
+    for match in PII_PATTERN.finditer(target):
+        compact = re.sub(r"[^0-9A-Za-z]", "", match.group(0)).upper()
+        if len(compact) == 17:
+            return compact
+    return ""
 
 
 def extract_doi(article: dict[str, Any]) -> str:
@@ -237,7 +274,7 @@ def classify_article(article: dict[str, Any]) -> dict[str, str | bool]:
     arxiv_id = extract_arxiv_id(article)
     announce_match = re.search(r"Announce Type:\s*([\w-]+)", summary, re.IGNORECASE)
     announce_type = announce_match.group(1).casefold() if announce_match else ""
-    is_preprint = bool(arxiv_id) or "researchsquare.com" in urlparse(url).netloc.casefold()
+    is_preprint = is_preprint_source(article)
 
     if is_preprint:
         work_type = "Preprint"
