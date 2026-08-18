@@ -363,6 +363,7 @@ async def refresh() -> dict[str, object]:
                     f"{label} {abstract_stats.get(key, 0)}"
                     for label, key in (
                         ("cache", "cache_hits"),
+                        ("arxiv feed", "arxiv_feed_hits"),
                         ("crossref", "crossref_batch_hits"),
                         ("europepmc", "europepmc_batch_hits"),
                         ("openalex", "openalex_batch_hits"),

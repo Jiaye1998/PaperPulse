@@ -1027,6 +1027,7 @@ async def enrich_articles_with_public_abstracts(
     stats: dict[str, Any] = {
         "attempted": 0,
         "cache_hits": 0,
+        "arxiv_feed_hits": 0,
         "complete": 0,
         "excerpt": 0,
         "unavailable": 0,
@@ -1046,6 +1047,7 @@ async def enrich_articles_with_public_abstracts(
         if arxiv:
             _apply_candidate(article, arxiv)
             stats["complete"] += 1
+            stats["arxiv_feed_hits"] += 1
             continue
         pending.append(article)
 
