@@ -559,8 +559,14 @@ async def _crossref_doi_batch(
     client: httpx.AsyncClient,
     gate: _ServiceGate,
     targets: dict[str, dict[str, Any]],
+    seen: set[str] | None = None,
 ) -> dict[str, AbstractCandidate]:
-    """Resolve many DOIs per request; same-name Crossref filters are OR-ed."""
+    """Resolve many DOIs per request; same-name Crossref filters are OR-ed.
+
+    Records every DOI Crossref answered for, including those with no abstract:
+    searching the same index by title for a work it has already described cannot
+    produce anything new.
+    """
     found: dict[str, AbstractCandidate] = {}
     for chunk in _chunked(sorted(targets), CROSSREF_BATCH_SIZE):
         payload = await _get_json(
@@ -581,6 +587,8 @@ async def _crossref_doi_batch(
             if not isinstance(work, dict):
                 continue
             doi = str(work.get("DOI") or "").casefold()
+            if seen is not None and doi:
+                seen.add(doi)
             article = targets.get(doi)
             if article is None:
                 continue
@@ -826,6 +834,7 @@ async def _resolve_by_doi(
     articles: Iterable[dict[str, Any]],
     resolved: dict[str, AbstractCandidate],
     stats: dict[str, Any],
+    crossref_seen: set[str] | None = None,
 ) -> None:
     """Walk the DOI-keyed services in order, carrying only the still-missing works."""
     targets: dict[str, dict[str, Any]] = {}
@@ -842,7 +851,10 @@ async def _resolve_by_doi(
         }
         if not pending:
             break
-        found = await resolver(client, gates[name], pending)
+        if name == "crossref":
+            found = await resolver(client, gates[name], pending, crossref_seen)
+        else:
+            found = await resolver(client, gates[name], pending)
         stats[f"{name}_batch_hits"] = len(found)
         resolved.update(found)
 
@@ -853,14 +865,20 @@ async def _resolve_by_title(
     articles: list[dict[str, Any]],
     resolved: dict[str, AbstractCandidate],
     stats: dict[str, Any],
+    crossref_seen: set[str] | None = None,
 ) -> None:
-    """Last metadata resort for works whose DOI is unknown, one query each."""
-    pending = [
+    """Last metadata resort, one query each, for works Crossref has not described."""
+    described = crossref_seen or set()
+    eligible = [
         article
         for article in articles
-        if str(article["id"]) not in resolved and str(article.get("title", "")).strip()
-    ][:TITLE_SEARCH_LIMIT]
+        if str(article["id"]) not in resolved
+        and str(article.get("title", "")).strip()
+        and str((article.get("raw") or {}).get("doi") or "").casefold() not in described
+    ]
+    pending = eligible[:TITLE_SEARCH_LIMIT]
     stats["title_search_attempted"] = len(pending)
+    stats["title_search_skipped_over_limit"] = len(eligible) - len(pending)
     hits = 0
     for article in pending:
         title = str(article.get("title", ""))
@@ -1095,8 +1113,9 @@ async def enrich_articles_with_public_abstracts(
             headers=headers,
         ) as client:
             await _resolve_elsevier_dois(client, gates["crossref"], pending, stats)
-            await _resolve_by_doi(client, gates, pending, resolved, stats)
-            await _resolve_by_title(client, gates, pending, resolved, stats)
+            crossref_seen: set[str] = set()
+            await _resolve_by_doi(client, gates, pending, resolved, stats, crossref_seen)
+            await _resolve_by_title(client, gates, pending, resolved, stats, crossref_seen)
             await _resolve_publisher_pages(
                 client, pending, resolved, blocked_hosts, stats
             )

@@ -358,6 +358,11 @@ async def refresh() -> dict[str, object]:
                     f"Inoreader zone 1 usage: {rate.get('usage') or '—'} / "
                     f"{rate.get('limit') or '—'}"
                 )
+                if abstract_stats.get("title_search_skipped_over_limit"):
+                    source_note += (
+                        f"; {abstract_stats['title_search_skipped_over_limit']} works "
+                        f"passed the title-search limit unqueried"
+                    )
                 if rate.get("truncated"):
                     source_note += (
                         f"; WARNING: more unread items exist than the "
